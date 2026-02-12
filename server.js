@@ -3,32 +3,24 @@ const cors = require('cors');
 const fs = require('fs').promises;
 const path = require('path');
 const multer = require('multer');
+const cloudinary = require('cloudinary').v2;
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Configurar Cloudinary
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME || 'dg3e6buy5',
+  api_key: process.env.CLOUDINARY_API_KEY || '368337259342651',
+  api_secret: process.env.CLOUDINARY_API_SECRET || 'b-9OsvrOuumqaC9rJ9yxzNH354E'
+});
+
 // Middleware
 app.use(cors());
 app.use(express.json());
-app.use('/uploads', express.static('uploads'));
 
-// Configuración de multer para subir imágenes
-const storage = multer.diskStorage({
-  destination: async (req, file, cb) => {
-    const dir = './uploads';
-    try {
-      await fs.mkdir(dir, { recursive: true });
-    } catch (err) {
-      console.error('Error creating uploads directory:', err);
-    }
-    cb(null, dir);
-  },
-  filename: (req, file, cb) => {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    cb(null, uniqueSuffix + path.extname(file.originalname));
-  }
-});
-
+// Configuración de multer para memoria (no guardar en disco)
+const storage = multer.memoryStorage();
 const upload = multer({ storage });
 
 // Rutas de base de datos
@@ -181,18 +173,31 @@ app.delete('/api/products/:id', async (req, res) => {
   }
 });
 
-// Subir imagen
-app.post('/api/upload', upload.single('image'), (req, res) => {
+// Subir imagen a Cloudinary
+app.post('/api/upload', upload.single('image'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ error: 'No se recibió ninguna imagen' });
     }
-    // Usar la IP local en lugar de localhost para que funcione en móvil
-    const host = req.get('host') || `192.168.3.115:${PORT}`;
-    const protocol = req.protocol;
-    const imageUrl = `${protocol}://${host}/uploads/${req.file.filename}`;
-    res.json({ url: imageUrl });
+
+    // Subir imagen a Cloudinary usando buffer
+    const result = await new Promise((resolve, reject) => {
+      const uploadStream = cloudinary.uploader.upload_stream(
+        { 
+          folder: 'fl-store',
+          resource_type: 'image'
+        },
+        (error, result) => {
+          if (error) reject(error);
+          else resolve(result);
+        }
+      );
+      uploadStream.end(req.file.buffer);
+    });
+
+    res.json({ url: result.secure_url });
   } catch (error) {
+    console.error('Error al subir imagen a Cloudinary:', error);
     res.status(500).json({ error: 'Error al subir imagen' });
   }
 });
