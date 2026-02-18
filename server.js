@@ -1,9 +1,11 @@
+require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const fs = require('fs').promises;
-const path = require('path');
+const mongoose = require('mongoose');
 const multer = require('multer');
 const cloudinary = require('cloudinary').v2;
+const Product = require('./models/Product');
+const User = require('./models/User');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -23,73 +25,23 @@ app.use(express.json());
 const storage = multer.memoryStorage();
 const upload = multer({ storage });
 
-// Rutas de base de datos
-const DB_PATH = './db.json';
+// Conectar a MongoDB
+const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/flstore';
 
-// Inicializar base de datos
-async function initDB() {
-  try {
-    await fs.access(DB_PATH);
-  } catch {
-    const initialData = {
-      products: [
-        {
-          id: '1',
-          name: 'Producto Premium 1',
-          description: 'Producto innovador con tecnología de última generación',
-          price: 299.99,
-          image: 'https://picsum.photos/400/400?random=1',
-          category: 'Tecnología',
-          isNew: true,
-        },
-        {
-          id: '2',
-          name: 'Producto Premium 2',
-          description: 'Diseño futurista y funcionalidad avanzada',
-          price: 499.99,
-          image: 'https://picsum.photos/400/400?random=2',
-          category: 'Premium',
-          isNew: true,
-        },
-        {
-          id: '3',
-          name: 'Producto Especial 3',
-          description: 'Calidad superior para clientes exigentes',
-          price: 199.99,
-          image: 'https://picsum.photos/400/400?random=3',
-          category: 'Especial',
-          isNew: false,
-        },
-        {
-          id: '4',
-          name: 'Producto Elite 4',
-          description: 'La mejor opción del mercado actual',
-          price: 799.99,
-          image: 'https://picsum.photos/400/400?random=4',
-          category: 'Elite',
-          isNew: true,
-        },
-      ],
-      users: [
-        {
-          username: 'MrFercho',
-          password: '1623Fercho'
-        }
-      ]
-    };
-    await fs.writeFile(DB_PATH, JSON.stringify(initialData, null, 2));
-  }
-}
-
-// Funciones helper
-async function readDB() {
-  const data = await fs.readFile(DB_PATH, 'utf8');
-  return JSON.parse(data);
-}
-
-async function writeDB(data) {
-  await fs.writeFile(DB_PATH, JSON.stringify(data, null, 2));
-}
+mongoose.connect(MONGODB_URI)
+  .then(async () => {
+    console.log('✅ Conectado a MongoDB');
+    // Inicializar usuario admin si no existe
+    const userCount = await User.countDocuments();
+    if (userCount === 0) {
+      await User.create({
+        username: 'MrFercho',
+        password: '1623Fercho'
+      });
+      console.log('✅ Usuario admin creado');
+    }
+  })
+  .catch(err => console.error('❌ Error conectando a MongoDB:', err));
 
 // ============ RUTAS ============
 
@@ -101,8 +53,8 @@ app.get('/', (req, res) => {
 // Obtener todos los productos
 app.get('/api/products', async (req, res) => {
   try {
-    const db = await readDB();
-    res.json(db.products);
+    const products = await Product.find().sort({ createdAt: -1 });
+    res.json(products);
   } catch (error) {
     res.status(500).json({ error: 'Error al obtener productos' });
   }
@@ -111,8 +63,7 @@ app.get('/api/products', async (req, res) => {
 // Obtener un producto por ID
 app.get('/api/products/:id', async (req, res) => {
   try {
-    const db = await readDB();
-    const product = db.products.find(p => p.id === req.params.id);
+    const product = await Product.findOne({ id: req.params.id });
     if (product) {
       res.json(product);
     } else {
@@ -126,13 +77,10 @@ app.get('/api/products/:id', async (req, res) => {
 // Crear producto
 app.post('/api/products', async (req, res) => {
   try {
-    const db = await readDB();
-    const newProduct = {
+    const newProduct = await Product.create({
       id: Date.now().toString(),
       ...req.body
-    };
-    db.products.unshift(newProduct);
-    await writeDB(db);
+    });
     res.status(201).json(newProduct);
   } catch (error) {
     res.status(500).json({ error: 'Error al crear producto' });
@@ -142,12 +90,13 @@ app.post('/api/products', async (req, res) => {
 // Actualizar producto
 app.put('/api/products/:id', async (req, res) => {
   try {
-    const db = await readDB();
-    const index = db.products.findIndex(p => p.id === req.params.id);
-    if (index !== -1) {
-      db.products[index] = { ...req.body, id: req.params.id };
-      await writeDB(db);
-      res.json(db.products[index]);
+    const product = await Product.findOneAndUpdate(
+      { id: req.params.id },
+      { ...req.body, id: req.params.id },
+      { new: true }
+    );
+    if (product) {
+      res.json(product);
     } else {
       res.status(404).json({ error: 'Producto no encontrado' });
     }
@@ -159,11 +108,8 @@ app.put('/api/products/:id', async (req, res) => {
 // Eliminar producto
 app.delete('/api/products/:id', async (req, res) => {
   try {
-    const db = await readDB();
-    const filtered = db.products.filter(p => p.id !== req.params.id);
-    if (filtered.length < db.products.length) {
-      db.products = filtered;
-      await writeDB(db);
+    const product = await Product.findOneAndDelete({ id: req.params.id });
+    if (product) {
       res.json({ message: 'Producto eliminado' });
     } else {
       res.status(404).json({ error: 'Producto no encontrado' });
@@ -206,8 +152,7 @@ app.post('/api/upload', upload.single('image'), async (req, res) => {
 app.post('/api/login', async (req, res) => {
   try {
     const { username, password } = req.body;
-    const db = await readDB();
-    const user = db.users.find(u => u.username === username && u.password === password);
+    const user = await User.findOne({ username, password });
     if (user) {
       res.json({ success: true, message: 'Login exitoso' });
     } else {
@@ -218,10 +163,8 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
-// Inicializar y arrancar servidor
-initDB().then(() => {
-  app.listen(PORT, () => {
-    console.log(`\n🚀 FL Store API corriendo en http://localhost:${PORT}`);
-    console.log(`📦 Base de datos: ${path.resolve(DB_PATH)}\n`);
-  });
+// Arrancar servidor
+app.listen(PORT, () => {
+  console.log(`\n🚀 FL Store API corriendo en http://localhost:${PORT}`);
+  console.log(`📦 Base de datos: MongoDB\n`);
 });
