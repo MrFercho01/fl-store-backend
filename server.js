@@ -10,6 +10,7 @@ const Product = require('./models/Product');
 const User = require('./models/User');
 const Review = require('./models/Review');
 const SiteMetric = require('./models/SiteMetric');
+const SiteVisit = require('./models/SiteVisit');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -347,6 +348,17 @@ const sendReviewNotificationEmail = async (review) => {
   }
 };
 
+const getClientIp = (req) => {
+  const forwarded = String(req.headers['x-forwarded-for'] || '').trim();
+  if (forwarded) {
+    return forwarded.split(',')[0].trim();
+  }
+
+  return String(req.ip || req.socket?.remoteAddress || '').trim();
+};
+
+const getDayKey = () => new Date().toISOString().slice(0, 10);
+
 // Conectar a MongoDB
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/flstore';
 
@@ -395,6 +407,38 @@ app.post('/api/metrics/visit', visitRegisterLimiter, async (req, res) => {
       return res.status(400).json({ error: 'visitorId es obligatorio' });
     }
 
+    const now = new Date();
+    const dayKey = getDayKey();
+    const ipAddress = getClientIp(req);
+    const userAgent = String(req.headers['user-agent'] || '').slice(0, 255);
+
+    const existingVisit = await SiteVisit.findOne({ visitorId, dayKey });
+
+    if (existingVisit) {
+      existingVisit.lastVisitedAt = now;
+      if (ipAddress) {
+        existingVisit.ipAddress = ipAddress;
+      }
+      if (userAgent) {
+        existingVisit.userAgent = userAgent;
+      }
+      await existingVisit.save();
+
+      const currentMetric = await SiteMetric.findOne({ key: 'site_visits' });
+      return res.status(200).json({
+        totalVisits: Number(currentMetric?.value ?? 0),
+      });
+    }
+
+    await SiteVisit.create({
+      visitorId,
+      dayKey,
+      ipAddress,
+      userAgent,
+      firstVisitedAt: now,
+      lastVisitedAt: now,
+    });
+
     const updatedMetric = await SiteMetric.findOneAndUpdate(
       { key: 'site_visits' },
       { $inc: { value: 1 } },
@@ -406,6 +450,33 @@ app.post('/api/metrics/visit', visitRegisterLimiter, async (req, res) => {
     });
   } catch (error) {
     return res.status(500).json({ error: 'Error al registrar visita' });
+  }
+});
+
+// Métricas admin de visitas
+app.get('/api/metrics/admin', async (req, res) => {
+  try {
+    const totalMetric = await SiteMetric.findOne({ key: 'site_visits' });
+    const totalVisits = Number(totalMetric?.value ?? 0);
+
+    const dayKey = getDayKey();
+    const todayVisits = await SiteVisit.countDocuments({ dayKey });
+
+    const uniqueVisitors = await SiteVisit.distinct('visitorId');
+
+    const recentVisits = await SiteVisit.find()
+      .sort({ lastVisitedAt: -1 })
+      .limit(20)
+      .select({ visitorId: 1, ipAddress: 1, lastVisitedAt: 1, _id: 0 });
+
+    return res.json({
+      totalVisits,
+      todayVisits,
+      uniqueVisitors: uniqueVisitors.length,
+      recentVisits,
+    });
+  } catch (error) {
+    return res.status(500).json({ error: 'Error al obtener métricas admin' });
   }
 });
 
