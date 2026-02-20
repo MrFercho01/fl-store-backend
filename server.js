@@ -143,6 +143,35 @@ const getMailFromAddress = (smtpUser) => {
   return `FL Store <${smtpUser}>`;
 };
 
+const isValidFromAddress = (value) => {
+  const normalized = String(value || '').trim();
+  if (!normalized) return false;
+  if (isValidEmail(normalized)) return true;
+
+  const namedMatch = normalized.match(/^.+<([^<>]+)>$/);
+  return Boolean(namedMatch && isValidEmail(namedMatch[1]));
+};
+
+const normalizeResendFromAddress = (value, fallbackFromAddress) => {
+  const raw = String(value || '').trim();
+  const fallback = String(fallbackFromAddress || '').trim();
+
+  const baseCandidate = raw || fallback || 'onboarding@resend.dev';
+  const trimmedToBracket = baseCandidate.includes('>')
+    ? `${baseCandidate.split('>')[0]}>`
+    : baseCandidate;
+
+  if (isValidFromAddress(trimmedToBracket)) {
+    return trimmedToBracket;
+  }
+
+  if (isValidFromAddress(fallback)) {
+    return fallback;
+  }
+
+  return 'onboarding@resend.dev';
+};
+
 const getReviewEmailContent = (review) => {
   const subject = `Nueva reseña pendiente de aprobación - ${review.productName}`;
   const text = [
@@ -165,8 +194,8 @@ const sendWithResend = async ({ subject, text, toAddress, fallbackFromAddress })
     return false;
   }
 
-  const fromAddress = RESEND_FROM || fallbackFromAddress;
-  if (!isValidEmail(toAddress) || !fromAddress) {
+  const fromAddress = normalizeResendFromAddress(RESEND_FROM, fallbackFromAddress);
+  if (!isValidEmail(toAddress) || !isValidFromAddress(fromAddress)) {
     console.warn('⚠️ Configuración inválida para Resend.');
     return false;
   }
