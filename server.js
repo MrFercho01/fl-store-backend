@@ -91,11 +91,68 @@ const upload = multer({ storage });
 
 const REVIEW_NOTIFICATION_EMAIL = process.env.REVIEW_NOTIFICATION_EMAIL || 'fernando.lara.moran@gmail.com';
 
-const createMailTransporter = () => {
-  const host = process.env.SMTP_HOST;
+const isValidEmail = (value) => {
+  const normalized = String(value || '').trim();
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalized);
+};
+
+const parseBooleanEnv = (value) => {
+  if (typeof value !== 'string') return null;
+
+  const normalized = value.trim().toLowerCase();
+  if (['true', '1', 'yes', 'on'].includes(normalized)) return true;
+  if (['false', '0', 'no', 'off'].includes(normalized)) return false;
+
+  return null;
+};
+
+const getSmtpConfig = () => {
+  const host = String(process.env.SMTP_HOST || '').trim();
   const port = Number(process.env.SMTP_PORT || 587);
-  const user = process.env.SMTP_USER;
-  const pass = process.env.SMTP_PASS;
+  const user = String(process.env.SMTP_USER || '').trim();
+  const pass = String(process.env.SMTP_PASS || '').trim();
+
+  const secureFromEnv = parseBooleanEnv(process.env.SMTP_SECURE);
+  const secure = secureFromEnv === null ? port === 465 : secureFromEnv;
+
+  const requireTlsFromEnv = parseBooleanEnv(process.env.SMTP_REQUIRE_TLS);
+  const requireTLS = requireTlsFromEnv === null ? (!secure && port === 587) : requireTlsFromEnv;
+
+  const rejectUnauthorizedFromEnv = parseBooleanEnv(process.env.SMTP_TLS_REJECT_UNAUTHORIZED);
+  const tlsRejectUnauthorized = rejectUnauthorizedFromEnv === null ? true : rejectUnauthorizedFromEnv;
+
+  return {
+    host,
+    port,
+    user,
+    pass,
+    secure,
+    requireTLS,
+    tlsRejectUnauthorized,
+    connectionTimeout: Number(process.env.SMTP_CONNECTION_TIMEOUT || 20000),
+    greetingTimeout: Number(process.env.SMTP_GREETING_TIMEOUT || 15000),
+    socketTimeout: Number(process.env.SMTP_SOCKET_TIMEOUT || 25000),
+  };
+};
+
+const getMailFromAddress = (smtpUser) => {
+  const fromFromEnv = String(process.env.SMTP_FROM || '').trim();
+  if (fromFromEnv) return fromFromEnv;
+  return `FL Store <${smtpUser}>`;
+};
+
+const logSmtpConfig = () => {
+  const config = getSmtpConfig();
+  const hasCredentials = Boolean(config.host && config.port && config.user && config.pass);
+
+  console.log(
+    `✉️ SMTP config => host=${config.host || 'N/A'} port=${config.port} secure=${config.secure} requireTLS=${config.requireTLS} user=${config.user || 'N/A'} auth=${hasCredentials ? 'ok' : 'missing'}`
+  );
+};
+
+const createMailTransporter = () => {
+  const config = getSmtpConfig();
+  const { host, port, user, pass } = config;
 
   if (!host || !user || !pass) {
     return null;
@@ -104,12 +161,36 @@ const createMailTransporter = () => {
   return nodemailer.createTransport({
     host,
     port,
-    secure: port === 465,
+    secure: config.secure,
+    requireTLS: config.requireTLS,
     auth: {
       user,
       pass,
     },
+    connectionTimeout: config.connectionTimeout,
+    greetingTimeout: config.greetingTimeout,
+    socketTimeout: config.socketTimeout,
+    tls: {
+      minVersion: 'TLSv1.2',
+      rejectUnauthorized: config.tlsRejectUnauthorized,
+      servername: host,
+    },
   });
+};
+
+const verifyMailTransport = async () => {
+  try {
+    const transporter = createMailTransporter();
+    if (!transporter) {
+      console.warn('⚠️ SMTP no configurado: faltan variables requeridas.');
+      return;
+    }
+
+    await transporter.verify();
+    console.log('✅ SMTP conectado y listo para enviar correos');
+  } catch (error) {
+    console.error('❌ SMTP verify falló:', error?.code || error?.name || 'UnknownError', error?.message || 'Sin detalle');
+  }
 };
 
 const sendReviewNotificationEmail = async (review) => {
@@ -133,14 +214,27 @@ const sendReviewNotificationEmail = async (review) => {
       `Fecha: ${new Date(review.createdAt).toLocaleString('es-EC')}`,
     ].join('\n');
 
+    const smtpConfig = getSmtpConfig();
+    const fromAddress = getMailFromAddress(smtpConfig.user);
+    const toAddress = isValidEmail(REVIEW_NOTIFICATION_EMAIL)
+      ? REVIEW_NOTIFICATION_EMAIL
+      : smtpConfig.user;
+
+    if (!isValidEmail(toAddress)) {
+      console.warn('⚠️ REVIEW_NOTIFICATION_EMAIL y SMTP_USER inválidos. No se envía correo de reseña.');
+      return;
+    }
+
     await transporter.sendMail({
-      from: process.env.SMTP_FROM || process.env.SMTP_USER,
-      to: REVIEW_NOTIFICATION_EMAIL,
+      from: fromAddress,
+      to: toAddress,
       subject,
       text,
     });
+
+    console.log(`📨 Correo de reseña enviado a ${toAddress}`);
   } catch (error) {
-    console.error('❌ Error enviando correo de reseña:', error.message);
+    console.error('❌ Error enviando correo de reseña:', error?.code || error?.name || 'UnknownError', error?.message || 'Sin detalle');
   }
 };
 
@@ -452,4 +546,6 @@ app.patch('/api/reviews/:id/status', async (req, res) => {
 app.listen(PORT, () => {
   console.log(`\n🚀 FL Store API corriendo en http://localhost:${PORT}`);
   console.log(`📦 Base de datos: MongoDB\n`);
+  logSmtpConfig();
+  void verifyMailTransport();
 });
