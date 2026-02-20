@@ -9,6 +9,7 @@ const nodemailer = require('nodemailer');
 const Product = require('./models/Product');
 const User = require('./models/User');
 const Review = require('./models/Review');
+const SiteMetric = require('./models/SiteMetric');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -88,6 +89,11 @@ app.use('/api', apiLimiter);
 // Configuración de multer para memoria (no guardar en disco)
 const storage = multer.memoryStorage();
 const upload = multer({ storage });
+const visitRegisterLimiter = createLimiter({
+  windowMs: 5 * 60 * 1000,
+  max: 20,
+  message: 'Demasiados registros de visita en poco tiempo.',
+});
 
 const REVIEW_NOTIFICATION_EMAIL = process.env.REVIEW_NOTIFICATION_EMAIL || 'fernando.lara.moran@gmail.com';
 const RESEND_API_KEY = String(process.env.RESEND_API_KEY || '').trim();
@@ -364,6 +370,43 @@ mongoose.connect(MONGODB_URI)
 // Health check
 app.get('/', (req, res) => {
   res.json({ message: 'FL Store API running' });
+});
+
+// Métricas públicas del sitio
+app.get('/api/metrics/public', async (req, res) => {
+  try {
+    const visitsMetric = await SiteMetric.findOne({ key: 'site_visits' });
+    const totalVisits = Number(visitsMetric?.value ?? 0);
+
+    return res.json({
+      totalVisits,
+      updatedAt: visitsMetric?.updatedAt ?? null,
+    });
+  } catch (error) {
+    return res.status(500).json({ error: 'Error al obtener métricas públicas' });
+  }
+});
+
+// Registrar visita de sitio
+app.post('/api/metrics/visit', visitRegisterLimiter, async (req, res) => {
+  try {
+    const visitorId = String(req.body?.visitorId || '').trim();
+    if (!visitorId) {
+      return res.status(400).json({ error: 'visitorId es obligatorio' });
+    }
+
+    const updatedMetric = await SiteMetric.findOneAndUpdate(
+      { key: 'site_visits' },
+      { $inc: { value: 1 } },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+
+    return res.status(201).json({
+      totalVisits: Number(updatedMetric?.value ?? 0),
+    });
+  } catch (error) {
+    return res.status(500).json({ error: 'Error al registrar visita' });
+  }
 });
 
 // Obtener todos los productos
