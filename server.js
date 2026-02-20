@@ -90,6 +90,8 @@ const storage = multer.memoryStorage();
 const upload = multer({ storage });
 
 const REVIEW_NOTIFICATION_EMAIL = process.env.REVIEW_NOTIFICATION_EMAIL || 'fernando.lara.moran@gmail.com';
+const RESEND_API_KEY = String(process.env.RESEND_API_KEY || '').trim();
+const RESEND_FROM = String(process.env.RESEND_FROM || '').trim();
 
 const isValidEmail = (value) => {
   const normalized = String(value || '').trim();
@@ -141,6 +143,63 @@ const getMailFromAddress = (smtpUser) => {
   return `FL Store <${smtpUser}>`;
 };
 
+const getReviewEmailContent = (review) => {
+  const subject = `Nueva reseña pendiente de aprobación - ${review.productName}`;
+  const text = [
+    'Se recibió un nuevo comentario en FL Store.',
+    '',
+    `Cliente: ${review.customerName}`,
+    `Producto: ${review.productName}`,
+    `Categoría: ${review.category}`,
+    `Calificación: ${review.rating}/5`,
+    `Comentario: ${review.comment}`,
+    `Estado: ${review.status}`,
+    `Fecha: ${new Date(review.createdAt).toLocaleString('es-EC')}`,
+  ].join('\n');
+
+  return { subject, text };
+};
+
+const sendWithResend = async ({ subject, text, toAddress, fallbackFromAddress }) => {
+  if (!RESEND_API_KEY) {
+    return false;
+  }
+
+  const fromAddress = RESEND_FROM || fallbackFromAddress;
+  if (!isValidEmail(toAddress) || !fromAddress) {
+    console.warn('⚠️ Configuración inválida para Resend.');
+    return false;
+  }
+
+  try {
+    const response = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${RESEND_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        from: fromAddress,
+        to: [toAddress],
+        subject,
+        text,
+      }),
+    });
+
+    if (!response.ok) {
+      const errorBody = await response.text();
+      console.error('❌ Resend falló:', response.status, errorBody);
+      return false;
+    }
+
+    console.log(`📨 Correo de reseña enviado por Resend a ${toAddress}`);
+    return true;
+  } catch (error) {
+    console.error('❌ Error enviando con Resend:', error?.message || 'Sin detalle');
+    return false;
+  }
+};
+
 const logSmtpConfig = () => {
   const config = getSmtpConfig();
   const hasCredentials = Boolean(config.host && config.port && config.user && config.pass);
@@ -182,7 +241,11 @@ const verifyMailTransport = async () => {
   try {
     const transporter = createMailTransporter();
     if (!transporter) {
-      console.warn('⚠️ SMTP no configurado: faltan variables requeridas.');
+      if (RESEND_API_KEY) {
+        console.warn('⚠️ SMTP no configurado. Se usará Resend como proveedor principal.');
+      } else {
+        console.warn('⚠️ SMTP no configurado: faltan variables requeridas.');
+      }
       return;
     }
 
@@ -190,38 +253,38 @@ const verifyMailTransport = async () => {
     console.log('✅ SMTP conectado y listo para enviar correos');
   } catch (error) {
     console.error('❌ SMTP verify falló:', error?.code || error?.name || 'UnknownError', error?.message || 'Sin detalle');
+    if (RESEND_API_KEY) {
+      console.warn('ℹ️ Se intentará enviar correos con Resend cuando SMTP falle.');
+    }
   }
 };
 
 const sendReviewNotificationEmail = async (review) => {
+  const { subject, text } = getReviewEmailContent(review);
+  const smtpConfig = getSmtpConfig();
+  const fromAddress = getMailFromAddress(smtpConfig.user);
+  const toAddress = isValidEmail(REVIEW_NOTIFICATION_EMAIL)
+    ? REVIEW_NOTIFICATION_EMAIL
+    : smtpConfig.user;
+
+  if (!isValidEmail(toAddress)) {
+    console.warn('⚠️ REVIEW_NOTIFICATION_EMAIL y SMTP_USER inválidos. No se envía correo de reseña.');
+    return;
+  }
+
   try {
     const transporter = createMailTransporter();
     if (!transporter) {
-      console.warn('⚠️ SMTP no configurado. Se guardó la reseña pero no se envió correo.');
-      return;
-    }
+      const sentWithResend = await sendWithResend({
+        subject,
+        text,
+        toAddress,
+        fallbackFromAddress: fromAddress,
+      });
 
-    const subject = `Nueva reseña pendiente de aprobación - ${review.productName}`;
-    const text = [
-      'Se recibió un nuevo comentario en FL Store.',
-      '',
-      `Cliente: ${review.customerName}`,
-      `Producto: ${review.productName}`,
-      `Categoría: ${review.category}`,
-      `Calificación: ${review.rating}/5`,
-      `Comentario: ${review.comment}`,
-      `Estado: ${review.status}`,
-      `Fecha: ${new Date(review.createdAt).toLocaleString('es-EC')}`,
-    ].join('\n');
-
-    const smtpConfig = getSmtpConfig();
-    const fromAddress = getMailFromAddress(smtpConfig.user);
-    const toAddress = isValidEmail(REVIEW_NOTIFICATION_EMAIL)
-      ? REVIEW_NOTIFICATION_EMAIL
-      : smtpConfig.user;
-
-    if (!isValidEmail(toAddress)) {
-      console.warn('⚠️ REVIEW_NOTIFICATION_EMAIL y SMTP_USER inválidos. No se envía correo de reseña.');
+      if (!sentWithResend) {
+        console.warn('⚠️ SMTP/Resend no configurados. Se guardó la reseña pero no se envió correo.');
+      }
       return;
     }
 
@@ -235,6 +298,17 @@ const sendReviewNotificationEmail = async (review) => {
     console.log(`📨 Correo de reseña enviado a ${toAddress}`);
   } catch (error) {
     console.error('❌ Error enviando correo de reseña:', error?.code || error?.name || 'UnknownError', error?.message || 'Sin detalle');
+
+    const sentWithResend = await sendWithResend({
+      subject,
+      text,
+      toAddress,
+      fallbackFromAddress: fromAddress,
+    });
+
+    if (!sentWithResend) {
+      console.warn('⚠️ Falló SMTP y no se pudo enviar por Resend.');
+    }
   }
 };
 
@@ -547,5 +621,8 @@ app.listen(PORT, () => {
   console.log(`\n🚀 FL Store API corriendo en http://localhost:${PORT}`);
   console.log(`📦 Base de datos: MongoDB\n`);
   logSmtpConfig();
+  if (RESEND_API_KEY) {
+    console.log('✉️ Resend fallback habilitado');
+  }
   void verifyMailTransport();
 });
