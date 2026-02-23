@@ -23,6 +23,17 @@ const siteVisitSchema = new mongoose.Schema({
     default: '',
     trim: true,
   },
+  isInternalVisit: {
+    type: Boolean,
+    default: false,
+    index: true,
+  },
+  visitSource: {
+    type: String,
+    enum: ['customer', 'admin', 'internal_ip'],
+    default: 'customer',
+    index: true,
+  },
   firstVisitedAt: {
     type: Date,
     default: Date.now,

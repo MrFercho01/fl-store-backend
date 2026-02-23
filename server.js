@@ -357,6 +357,92 @@ const getClientIp = (req) => {
   return String(req.ip || req.socket?.remoteAddress || '').trim();
 };
 
+const normalizeIp = (value) => {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+
+  const withoutPrefix = raw.startsWith('::ffff:') ? raw.slice(7) : raw;
+  const withoutPort = withoutPrefix.includes(':') && withoutPrefix.split(':').length === 2
+    ? withoutPrefix.split(':')[0]
+    : withoutPrefix;
+  return withoutPort.toLowerCase();
+};
+
+const escapeRegex = (value) => String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+const INTERNAL_IP_WHITELIST = new Set(
+  String(process.env.INTERNAL_IP_WHITELIST || '')
+    .split(',')
+    .map((item) => normalizeIp(item))
+    .filter(Boolean)
+);
+
+const INTERNAL_IP_PREFIX_WHITELIST = [
+  ...new Set(
+    String(process.env.INTERNAL_IP_PREFIX_WHITELIST || '186.68')
+      .split(',')
+      .map((item) => normalizeIp(item))
+      .filter(Boolean)
+  ),
+];
+
+const isInternalIpAddress = (ipAddress) => {
+  const normalizedIp = normalizeIp(ipAddress);
+  if (!normalizedIp) return false;
+
+  if (INTERNAL_IP_WHITELIST.has(normalizedIp)) return true;
+  return INTERNAL_IP_PREFIX_WHITELIST.some((prefix) => normalizedIp.startsWith(prefix));
+};
+
+const buildInternalIpConditions = () => {
+  const conditions = [];
+
+  INTERNAL_IP_WHITELIST.forEach((ip) => {
+    const escapedIp = escapeRegex(ip);
+    conditions.push({ ipAddress: { $regex: `^(::ffff:)?${escapedIp}(:\\d+)?$`, $options: 'i' } });
+  });
+
+  INTERNAL_IP_PREFIX_WHITELIST.forEach((prefix) => {
+    const escapedPrefix = escapeRegex(prefix);
+    conditions.push({ ipAddress: { $regex: `^(::ffff:)?${escapedPrefix}`, $options: 'i' } });
+  });
+
+  return conditions;
+};
+
+const buildInternalVisitQuery = (extraQuery = {}) => {
+  const internalIpConditions = buildInternalIpConditions();
+  return {
+    ...extraQuery,
+    $or: [{ isInternalVisit: true }, ...internalIpConditions],
+  };
+};
+
+const buildCustomerVisitQuery = (extraQuery = {}) => {
+  const internalIpConditions = buildInternalIpConditions();
+  return {
+    ...extraQuery,
+    $nor: [{ isInternalVisit: true }, ...internalIpConditions],
+  };
+};
+
+const getVisitClassification = ({ ipAddress, isAdminVisit }) => {
+  if (isAdminVisit) {
+    return { isInternalVisit: true, visitSource: 'admin' };
+  }
+
+  const normalizedIp = normalizeIp(ipAddress);
+  const isInternalExact = normalizedIp && INTERNAL_IP_WHITELIST.has(normalizedIp);
+  const isInternalByPrefix = normalizedIp
+    && INTERNAL_IP_PREFIX_WHITELIST.some((prefix) => normalizedIp.startsWith(prefix));
+
+  if (isInternalExact || isInternalByPrefix) {
+    return { isInternalVisit: true, visitSource: 'internal_ip' };
+  }
+
+  return { isInternalVisit: false, visitSource: 'customer' };
+};
+
 const getDayKey = () => new Date().toISOString().slice(0, 10);
 
 // Conectar a MongoDB
@@ -389,9 +475,12 @@ app.get('/api/metrics/public', async (req, res) => {
   try {
     const visitsMetric = await SiteMetric.findOne({ key: 'site_visits' });
     const totalVisits = Number(visitsMetric?.value ?? 0);
+    const internalVisits = await SiteVisit.countDocuments(buildInternalVisitQuery());
+    const customerVisits = Math.max(0, totalVisits - internalVisits);
 
     return res.json({
       totalVisits,
+      customerVisits,
       updatedAt: visitsMetric?.updatedAt ?? null,
     });
   } catch (error) {
@@ -403,6 +492,7 @@ app.get('/api/metrics/public', async (req, res) => {
 app.post('/api/metrics/visit', visitRegisterLimiter, async (req, res) => {
   try {
     const visitorId = String(req.body?.visitorId || '').trim();
+    const isAdminVisit = Boolean(req.body?.isAdminVisit);
     if (!visitorId) {
       return res.status(400).json({ error: 'visitorId es obligatorio' });
     }
@@ -411,6 +501,7 @@ app.post('/api/metrics/visit', visitRegisterLimiter, async (req, res) => {
     const dayKey = getDayKey();
     const ipAddress = getClientIp(req);
     const userAgent = String(req.headers['user-agent'] || '').slice(0, 255);
+    const visitClassification = getVisitClassification({ ipAddress, isAdminVisit });
 
     const existingVisit = await SiteVisit.findOne({ visitorId, dayKey });
 
@@ -422,11 +513,16 @@ app.post('/api/metrics/visit', visitRegisterLimiter, async (req, res) => {
       if (userAgent) {
         existingVisit.userAgent = userAgent;
       }
+      existingVisit.isInternalVisit = visitClassification.isInternalVisit;
+      existingVisit.visitSource = visitClassification.visitSource;
       await existingVisit.save();
 
       const currentMetric = await SiteMetric.findOne({ key: 'site_visits' });
+      const internalVisits = await SiteVisit.countDocuments(buildInternalVisitQuery());
+      const customerVisits = Math.max(0, Number(currentMetric?.value ?? 0) - internalVisits);
       return res.status(200).json({
         totalVisits: Number(currentMetric?.value ?? 0),
+        customerVisits,
       });
     }
 
@@ -435,6 +531,8 @@ app.post('/api/metrics/visit', visitRegisterLimiter, async (req, res) => {
       dayKey,
       ipAddress,
       userAgent,
+      isInternalVisit: visitClassification.isInternalVisit,
+      visitSource: visitClassification.visitSource,
       firstVisitedAt: now,
       lastVisitedAt: now,
     });
@@ -445,8 +543,12 @@ app.post('/api/metrics/visit', visitRegisterLimiter, async (req, res) => {
       { upsert: true, new: true, setDefaultsOnInsert: true }
     );
 
+    const internalVisits = await SiteVisit.countDocuments(buildInternalVisitQuery());
+    const customerVisits = Math.max(0, Number(updatedMetric?.value ?? 0) - internalVisits);
+
     return res.status(201).json({
       totalVisits: Number(updatedMetric?.value ?? 0),
+      customerVisits,
     });
   } catch (error) {
     return res.status(500).json({ error: 'Error al registrar visita' });
@@ -461,18 +563,45 @@ app.get('/api/metrics/admin', async (req, res) => {
 
     const dayKey = getDayKey();
     const todayVisits = await SiteVisit.countDocuments({ dayKey });
+    const internalVisits = await SiteVisit.countDocuments(buildInternalVisitQuery());
+    const customerVisits = Math.max(0, totalVisits - internalVisits);
+    const todayInternalVisits = await SiteVisit.countDocuments(buildInternalVisitQuery({ dayKey }));
+    const todayCustomerVisits = Math.max(0, todayVisits - todayInternalVisits);
 
     const uniqueVisitors = await SiteVisit.distinct('visitorId');
+    const uniqueCustomerVisitors = await SiteVisit.distinct('visitorId', buildCustomerVisitQuery());
 
-    const recentVisits = await SiteVisit.find()
+    const recentVisitsRaw = await SiteVisit.find()
       .sort({ lastVisitedAt: -1 })
       .limit(20)
-      .select({ visitorId: 1, ipAddress: 1, lastVisitedAt: 1, _id: 0 });
+      .select({ visitorId: 1, ipAddress: 1, lastVisitedAt: 1, isInternalVisit: 1, visitSource: 1, _id: 0 });
+
+    const recentVisits = recentVisitsRaw.map((visit) => {
+      const inferredInternalByIp = isInternalIpAddress(visit.ipAddress);
+      const isInternalVisit = Boolean(visit.isInternalVisit) || inferredInternalByIp;
+      const visitSource = visit.visitSource && visit.visitSource !== 'customer'
+        ? visit.visitSource
+        : isInternalVisit
+          ? 'internal_ip'
+          : 'customer';
+
+      return {
+        visitorId: String(visit.visitorId || ''),
+        ipAddress: String(visit.ipAddress || ''),
+        lastVisitedAt: visit.lastVisitedAt,
+        isInternalVisit,
+        visitSource,
+      };
+    });
 
     return res.json({
       totalVisits,
+      customerVisits,
+      internalVisits,
       todayVisits,
+      todayCustomerVisits,
       uniqueVisitors: uniqueVisitors.length,
+      uniqueCustomerVisitors: uniqueCustomerVisitors.length,
       recentVisits,
     });
   } catch (error) {
