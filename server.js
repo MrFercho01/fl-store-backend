@@ -426,6 +426,55 @@ const buildCustomerVisitQuery = (extraQuery = {}) => {
   };
 };
 
+const buildAdminMetricsPayload = async () => {
+  const totalMetric = await SiteMetric.findOne({ key: 'site_visits' });
+  const totalVisits = Number(totalMetric?.value ?? 0);
+
+  const dayKey = getDayKey();
+  const todayVisits = await SiteVisit.countDocuments({ dayKey });
+  const internalVisits = await SiteVisit.countDocuments(buildInternalVisitQuery());
+  const customerVisits = Math.max(0, totalVisits - internalVisits);
+  const todayInternalVisits = await SiteVisit.countDocuments(buildInternalVisitQuery({ dayKey }));
+  const todayCustomerVisits = Math.max(0, todayVisits - todayInternalVisits);
+
+  const uniqueVisitors = await SiteVisit.distinct('visitorId');
+  const uniqueCustomerVisitors = await SiteVisit.distinct('visitorId', buildCustomerVisitQuery());
+
+  const recentVisitsRaw = await SiteVisit.find()
+    .sort({ lastVisitedAt: -1 })
+    .limit(20)
+    .select({ visitorId: 1, ipAddress: 1, lastVisitedAt: 1, isInternalVisit: 1, visitSource: 1, _id: 0 });
+
+  const recentVisits = recentVisitsRaw.map((visit) => {
+    const inferredInternalByIp = isInternalIpAddress(visit.ipAddress);
+    const isInternalVisit = Boolean(visit.isInternalVisit) || inferredInternalByIp;
+    const visitSource = visit.visitSource && visit.visitSource !== 'customer'
+      ? visit.visitSource
+      : isInternalVisit
+        ? 'internal_ip'
+        : 'customer';
+
+    return {
+      visitorId: String(visit.visitorId || ''),
+      ipAddress: String(visit.ipAddress || ''),
+      lastVisitedAt: visit.lastVisitedAt,
+      isInternalVisit,
+      visitSource,
+    };
+  });
+
+  return {
+    totalVisits,
+    customerVisits,
+    internalVisits,
+    todayVisits,
+    todayCustomerVisits,
+    uniqueVisitors: uniqueVisitors.length,
+    uniqueCustomerVisitors: uniqueCustomerVisitors.length,
+    recentVisits,
+  };
+};
+
 const getVisitClassification = ({ ipAddress, isAdminVisit }) => {
   if (isAdminVisit) {
     return { isInternalVisit: true, visitSource: 'admin' };
@@ -558,54 +607,65 @@ app.post('/api/metrics/visit', visitRegisterLimiter, async (req, res) => {
 // Métricas admin de visitas
 app.get('/api/metrics/admin', async (req, res) => {
   try {
-    const totalMetric = await SiteMetric.findOne({ key: 'site_visits' });
-    const totalVisits = Number(totalMetric?.value ?? 0);
-
-    const dayKey = getDayKey();
-    const todayVisits = await SiteVisit.countDocuments({ dayKey });
-    const internalVisits = await SiteVisit.countDocuments(buildInternalVisitQuery());
-    const customerVisits = Math.max(0, totalVisits - internalVisits);
-    const todayInternalVisits = await SiteVisit.countDocuments(buildInternalVisitQuery({ dayKey }));
-    const todayCustomerVisits = Math.max(0, todayVisits - todayInternalVisits);
-
-    const uniqueVisitors = await SiteVisit.distinct('visitorId');
-    const uniqueCustomerVisitors = await SiteVisit.distinct('visitorId', buildCustomerVisitQuery());
-
-    const recentVisitsRaw = await SiteVisit.find()
-      .sort({ lastVisitedAt: -1 })
-      .limit(20)
-      .select({ visitorId: 1, ipAddress: 1, lastVisitedAt: 1, isInternalVisit: 1, visitSource: 1, _id: 0 });
-
-    const recentVisits = recentVisitsRaw.map((visit) => {
-      const inferredInternalByIp = isInternalIpAddress(visit.ipAddress);
-      const isInternalVisit = Boolean(visit.isInternalVisit) || inferredInternalByIp;
-      const visitSource = visit.visitSource && visit.visitSource !== 'customer'
-        ? visit.visitSource
-        : isInternalVisit
-          ? 'internal_ip'
-          : 'customer';
-
-      return {
-        visitorId: String(visit.visitorId || ''),
-        ipAddress: String(visit.ipAddress || ''),
-        lastVisitedAt: visit.lastVisitedAt,
-        isInternalVisit,
-        visitSource,
-      };
-    });
-
-    return res.json({
-      totalVisits,
-      customerVisits,
-      internalVisits,
-      todayVisits,
-      todayCustomerVisits,
-      uniqueVisitors: uniqueVisitors.length,
-      uniqueCustomerVisitors: uniqueCustomerVisitors.length,
-      recentVisits,
-    });
+    const payload = await buildAdminMetricsPayload();
+    return res.json(payload);
   } catch (error) {
     return res.status(500).json({ error: 'Error al obtener métricas admin' });
+  }
+});
+
+// Recalcular métricas históricas y clasificación de visitas internas
+app.post('/api/metrics/admin/recalculate', async (req, res) => {
+  try {
+    const internalIpConditions = buildInternalIpConditions();
+
+    if (internalIpConditions.length > 0) {
+      await SiteVisit.updateMany(
+        {
+          visitSource: { $ne: 'admin' },
+          $or: internalIpConditions,
+        },
+        {
+          $set: {
+            isInternalVisit: true,
+            visitSource: 'internal_ip',
+          },
+        }
+      );
+
+      await SiteVisit.updateMany(
+        {
+          visitSource: { $ne: 'admin' },
+          $nor: internalIpConditions,
+        },
+        {
+          $set: {
+            isInternalVisit: false,
+            visitSource: 'customer',
+          },
+        }
+      );
+    }
+
+    await SiteVisit.updateMany(
+      { visitSource: 'admin' },
+      { $set: { isInternalVisit: true } }
+    );
+
+    const totalVisits = await SiteVisit.countDocuments();
+    await SiteMetric.findOneAndUpdate(
+      { key: 'site_visits' },
+      { $set: { value: totalVisits } },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+
+    const payload = await buildAdminMetricsPayload();
+    return res.json({
+      message: 'Métricas recalculadas correctamente',
+      ...payload,
+    });
+  } catch (error) {
+    return res.status(500).json({ error: 'Error al recalcular métricas históricas' });
   }
 });
 
