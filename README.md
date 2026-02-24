@@ -40,6 +40,23 @@ npm start
 - DELETE `/api/products/:id` - Eliminar producto
 - POST `/api/upload` - Subir imagen a Cloudinary
 - POST `/api/login` - Login de admin
+- GET `/downloads/fl-store-mobile.apk` - Descargar APK Android local (si existe en `backend/downloads`)
+- GET `/api/mobile/apk-info` - Estado, URL y contador de descargas del APK
+- POST `/api/mobile/push/test` - Enviar notificación push de prueba a tokens activos
+
+## APK local sin hosting externo
+
+Para instalar Android directo desde tu red local (sin Expo y sin host externo):
+
+1. Copia tu archivo APK dentro de `backend/downloads/` con nombre `fl-store-mobile.apk`.
+2. Inicia backend (`npm start`).
+3. Abre en tu celular (misma WiFi): `http://IP_DE_TU_MAC:3000/downloads/fl-store-mobile.apk`.
+
+Opcional en `.env`:
+
+```env
+MOBILE_APK_FILE_NAME=fl-store-mobile.apk
+```
 
 ## 💾 Base de Datos
 

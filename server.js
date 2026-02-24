@@ -6,14 +6,21 @@ const multer = require('multer');
 const rateLimit = require('express-rate-limit');
 const cloudinary = require('cloudinary').v2;
 const nodemailer = require('nodemailer');
+const fs = require('fs');
+const path = require('path');
 const Product = require('./models/Product');
 const User = require('./models/User');
 const Review = require('./models/Review');
 const SiteMetric = require('./models/SiteMetric');
 const SiteVisit = require('./models/SiteVisit');
+const MobilePushToken = require('./models/MobilePushToken');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const MOBILE_DOWNLOADS_DIR = path.resolve(__dirname, 'downloads');
+const MOBILE_APK_FILE_NAME = path.basename(String(process.env.MOBILE_APK_FILE_NAME || 'fl-store-mobile.apk').trim() || 'fl-store-mobile.apk');
+const MOBILE_APK_FILE_PATH = path.join(MOBILE_DOWNLOADS_DIR, MOBILE_APK_FILE_NAME);
+const ECUADOR_TIMEZONE = 'America/Guayaquil';
 
 app.set('trust proxy', 1);
 
@@ -87,6 +94,47 @@ const validateLikeCooldown = (req, res, next) => {
 
 app.use('/api', apiLimiter);
 
+app.get('/downloads/fl-store-mobile.apk', async (req, res) => {
+  try {
+    if (!fs.existsSync(MOBILE_APK_FILE_PATH)) {
+      return res.status(404).json({
+        error: 'APK no encontrado',
+        detail: `Coloca el instalador en backend/downloads/${MOBILE_APK_FILE_NAME}`,
+      });
+    }
+
+    await SiteMetric.findOneAndUpdate(
+      { key: 'mobile_apk_downloads' },
+      { $inc: { value: 1 } },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+
+    res.setHeader('Content-Type', 'application/vnd.android.package-archive');
+    res.setHeader('Content-Disposition', `attachment; filename="${MOBILE_APK_FILE_NAME}"`);
+    return res.sendFile(MOBILE_APK_FILE_PATH);
+  } catch (error) {
+    return res.status(500).json({ error: 'Error al preparar descarga del APK' });
+  }
+});
+
+app.get('/api/mobile/apk-info', async (req, res) => {
+  try {
+    const host = req.get('host');
+    const protocol = req.protocol || 'http';
+    const downloadUrl = `${protocol}://${host}/downloads/fl-store-mobile.apk`;
+    const apkDownloadsMetric = await SiteMetric.findOne({ key: 'mobile_apk_downloads' });
+
+    return res.json({
+      available: fs.existsSync(MOBILE_APK_FILE_PATH),
+      fileName: MOBILE_APK_FILE_NAME,
+      downloadUrl,
+      downloadCount: Number(apkDownloadsMetric?.value ?? 0),
+    });
+  } catch (error) {
+    return res.status(500).json({ error: 'Error al obtener información de APK' });
+  }
+});
+
 // Configuración de multer para memoria (no guardar en disco)
 const storage = multer.memoryStorage();
 const upload = multer({ storage });
@@ -99,6 +147,126 @@ const visitRegisterLimiter = createLimiter({
 const REVIEW_NOTIFICATION_EMAIL = process.env.REVIEW_NOTIFICATION_EMAIL || 'fernando.lara.moran@gmail.com';
 const RESEND_API_KEY = String(process.env.RESEND_API_KEY || '').trim();
 const RESEND_FROM = String(process.env.RESEND_FROM || '').trim();
+const EXPO_PUSH_API_URL = 'https://exp.host/--/api/v2/push/send';
+
+const isValidExpoPushToken = (token) => {
+  const normalized = String(token || '').trim();
+  return /^ExponentPushToken\[[\w-]+\]$/.test(normalized) || /^ExpoPushToken\[[\w-]+\]$/.test(normalized);
+};
+
+const normalizePlatform = (platform) => {
+  const normalized = String(platform || '').trim().toLowerCase();
+  if (['ios', 'android', 'web'].includes(normalized)) return normalized;
+  return 'unknown';
+};
+
+const chunkArray = (items, size) => {
+  const chunks = [];
+  for (let index = 0; index < items.length; index += size) {
+    chunks.push(items.slice(index, index + size));
+  }
+  return chunks;
+};
+
+const deactivateInvalidExpoTokens = async (tokens = []) => {
+  if (!tokens.length) return;
+
+  await MobilePushToken.updateMany(
+    { token: { $in: tokens } },
+    { $set: { active: false } }
+  );
+};
+
+const sendExpoPushNotificationToAll = async ({ title, body, data = {} }) => {
+  const activeTokens = await MobilePushToken.find({ active: true }).select('token -_id');
+  if (!activeTokens.length) {
+    return { delivered: 0, invalidated: 0 };
+  }
+
+  const messages = activeTokens
+    .map((item) => String(item.token || '').trim())
+    .filter((token) => isValidExpoPushToken(token))
+    .map((token) => ({
+      to: token,
+      sound: 'default',
+      title,
+      body,
+      data,
+      channelId: 'default',
+      priority: 'high',
+    }));
+
+  const invalidTokens = [];
+  const messageChunks = chunkArray(messages, 100);
+
+  for (const chunk of messageChunks) {
+    try {
+      const response = await fetch(EXPO_PUSH_API_URL, {
+        method: 'POST',
+        headers: {
+          Accept: 'application/json',
+          'Accept-encoding': 'gzip, deflate',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(chunk),
+      });
+
+      const payload = await response.json().catch(() => null);
+      const tickets = Array.isArray(payload?.data) ? payload.data : [];
+
+      tickets.forEach((ticket, ticketIndex) => {
+        if (ticket?.status !== 'error') return;
+
+        const errorCode = ticket?.details?.error;
+        if (errorCode === 'DeviceNotRegistered') {
+          const token = chunk[ticketIndex]?.to;
+          if (token) invalidTokens.push(token);
+        }
+      });
+    } catch (error) {
+      console.error('❌ Error enviando push por Expo:', error?.message || 'Sin detalle');
+    }
+  }
+
+  if (invalidTokens.length) {
+    await deactivateInvalidExpoTokens(invalidTokens);
+  }
+
+  return {
+    delivered: messages.length,
+    invalidated: invalidTokens.length,
+  };
+};
+
+const notifyProductCreated = async (product) => {
+  const title = '🆕 NUEVO! Producto en la tienda FL Store';
+  const body = `🔥 Descubre ${product.name} antes que todos. ¡Disponible ahora!`;
+
+  return sendExpoPushNotificationToAll({
+    title,
+    body,
+    data: {
+      type: 'new_product',
+      productId: product.id,
+    },
+  });
+};
+
+const notifyProductPriceUpdated = async ({ product, previousPrice }) => {
+  const title = '💥 OFERTA! 💸 Precio actualizado';
+  const body = `Aprovecha ${product.name} por solo $${Number(product.price).toFixed(2)} (antes $${Number(previousPrice).toFixed(2)}). ¡Por tiempo limitado!`;
+
+  return sendExpoPushNotificationToAll({
+    title,
+    body,
+    data: {
+      type: 'price_update',
+      productId: product.id,
+      previousPrice: Number(previousPrice),
+      newPrice: Number(product.price),
+    },
+  });
+};
 
 const isValidEmail = (value) => {
   const normalized = String(value || '').trim();
@@ -379,7 +547,7 @@ const INTERNAL_IP_WHITELIST = new Set(
 
 const INTERNAL_IP_PREFIX_WHITELIST = [
   ...new Set(
-    String(process.env.INTERNAL_IP_PREFIX_WHITELIST || '186.68')
+    String(process.env.INTERNAL_IP_PREFIX_WHITELIST || '')
       .split(',')
       .map((item) => normalizeIp(item))
       .filter(Boolean)
@@ -428,7 +596,9 @@ const buildCustomerVisitQuery = (extraQuery = {}) => {
 
 const buildAdminMetricsPayload = async () => {
   const totalMetric = await SiteMetric.findOne({ key: 'site_visits' });
+  const apkDownloadsMetric = await SiteMetric.findOne({ key: 'mobile_apk_downloads' });
   const totalVisits = Number(totalMetric?.value ?? 0);
+  const apkDownloads = Number(apkDownloadsMetric?.value ?? 0);
 
   const dayKey = getDayKey();
   const todayVisits = await SiteVisit.countDocuments({ dayKey });
@@ -465,6 +635,7 @@ const buildAdminMetricsPayload = async () => {
 
   return {
     totalVisits,
+    apkDownloads,
     customerVisits,
     internalVisits,
     todayVisits,
@@ -492,7 +663,14 @@ const getVisitClassification = ({ ipAddress, isAdminVisit }) => {
   return { isInternalVisit: false, visitSource: 'customer' };
 };
 
-const getDayKey = () => new Date().toISOString().slice(0, 10);
+const getDayKey = () => {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: ECUADOR_TIMEZONE,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(new Date());
+};
 
 // Conectar a MongoDB
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/flstore';
@@ -645,6 +823,18 @@ app.post('/api/metrics/admin/recalculate', async (req, res) => {
           },
         }
       );
+    } else {
+      await SiteVisit.updateMany(
+        {
+          visitSource: { $ne: 'admin' },
+        },
+        {
+          $set: {
+            isInternalVisit: false,
+            visitSource: 'customer',
+          },
+        }
+      );
     }
 
     await SiteVisit.updateMany(
@@ -679,6 +869,81 @@ app.get('/api/products', async (req, res) => {
   }
 });
 
+// Registrar token push de app móvil
+app.post('/api/mobile/push-token', async (req, res) => {
+  try {
+    const rawToken = String(req.body?.token || '').trim();
+    const platform = normalizePlatform(req.body?.platform);
+
+    if (!isValidExpoPushToken(rawToken)) {
+      return res.status(400).json({ error: 'Token push inválido' });
+    }
+
+    await MobilePushToken.findOneAndUpdate(
+      { token: rawToken },
+      {
+        $set: {
+          token: rawToken,
+          platform,
+          active: true,
+          lastSeenAt: new Date(),
+        },
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+
+    return res.status(201).json({ message: 'Token push registrado' });
+  } catch (error) {
+    return res.status(500).json({ error: 'Error al registrar token push' });
+  }
+});
+
+// Desactivar token push (logout/desinstalación)
+app.delete('/api/mobile/push-token', async (req, res) => {
+  try {
+    const rawToken = String(req.body?.token || '').trim();
+    if (!rawToken) {
+      return res.status(400).json({ error: 'Token push requerido' });
+    }
+
+    await MobilePushToken.findOneAndUpdate(
+      { token: rawToken },
+      { $set: { active: false, lastSeenAt: new Date() } },
+      { new: true }
+    );
+
+    return res.json({ message: 'Token push desactivado' });
+  } catch (error) {
+    return res.status(500).json({ error: 'Error al desactivar token push' });
+  }
+});
+
+app.post('/api/mobile/push/test', async (req, res) => {
+  try {
+    const title = String(req.body?.title || '🔔 Prueba de notificaciones').trim();
+    const body = String(req.body?.body || 'Notificación de prueba FL Store').trim();
+
+    const activeTokens = await MobilePushToken.countDocuments({ active: true });
+    const result = await sendExpoPushNotificationToAll({
+      title,
+      body,
+      data: {
+        type: 'manual_test',
+        sentAt: new Date().toISOString(),
+      },
+    });
+
+    return res.json({
+      message: 'Notificación de prueba enviada',
+      activeTokens,
+      delivered: Number(result?.delivered ?? 0),
+      invalidated: Number(result?.invalidated ?? 0),
+    });
+  } catch (error) {
+    return res.status(500).json({ error: 'Error al enviar notificación de prueba' });
+  }
+});
+
 // Obtener un producto por ID
 app.get('/api/products/:id', async (req, res) => {
   try {
@@ -700,6 +965,9 @@ app.post('/api/products', async (req, res) => {
       id: Date.now().toString(),
       ...req.body
     });
+
+    void notifyProductCreated(newProduct);
+
     res.status(201).json(newProduct);
   } catch (error) {
     res.status(500).json({ error: 'Error al crear producto' });
@@ -709,16 +977,29 @@ app.post('/api/products', async (req, res) => {
 // Actualizar producto
 app.put('/api/products/:id', async (req, res) => {
   try {
+    const existingProduct = await Product.findOne({ id: req.params.id });
+    if (!existingProduct) {
+      return res.status(404).json({ error: 'Producto no encontrado' });
+    }
+
+    const previousPrice = Number(existingProduct.price);
+
     const product = await Product.findOneAndUpdate(
       { id: req.params.id },
       { ...req.body, id: req.params.id },
       { new: true }
     );
-    if (product) {
-      res.json(product);
-    } else {
-      res.status(404).json({ error: 'Producto no encontrado' });
+
+    if (!product) {
+      return res.status(404).json({ error: 'Producto no encontrado' });
     }
+
+    const updatedPrice = Number(product.price);
+    if (Number.isFinite(previousPrice) && Number.isFinite(updatedPrice) && previousPrice !== updatedPrice) {
+      void notifyProductPriceUpdated({ product, previousPrice });
+    }
+
+    res.json(product);
   } catch (error) {
     res.status(500).json({ error: 'Error al actualizar producto' });
   }
