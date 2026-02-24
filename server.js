@@ -965,6 +965,35 @@ app.post('/api/mobile/push/test', async (req, res) => {
   }
 });
 
+app.get('/api/mobile/push/stats', async (req, res) => {
+  try {
+    const [totalTokens, activeTokens, androidActive, iosActive, webActive] = await Promise.all([
+      MobilePushToken.countDocuments(),
+      MobilePushToken.countDocuments({ active: true }),
+      MobilePushToken.countDocuments({ active: true, platform: 'android' }),
+      MobilePushToken.countDocuments({ active: true, platform: 'ios' }),
+      MobilePushToken.countDocuments({ active: true, platform: 'web' }),
+    ]);
+
+    const lastToken = await MobilePushToken.findOne({ active: true })
+      .sort({ lastSeenAt: -1 })
+      .select({ lastSeenAt: 1, _id: 0 });
+
+    return res.json({
+      totalTokens,
+      activeTokens,
+      activeByPlatform: {
+        android: androidActive,
+        ios: iosActive,
+        web: webActive,
+      },
+      lastSeenAt: lastToken?.lastSeenAt ?? null,
+    });
+  } catch (error) {
+    return res.status(500).json({ error: 'Error al obtener estadísticas de tokens push' });
+  }
+});
+
 app.post('/api/mobile/apk-downloads/recalculate', async (req, res) => {
   try {
     const totalUniqueDownloads = await MobileApkDownload.countDocuments();
@@ -995,6 +1024,23 @@ app.get('/api/products/:id', async (req, res) => {
     }
   } catch (error) {
     res.status(500).json({ error: 'Error al obtener producto' });
+  }
+});
+
+app.get('/api/products/version', async (req, res) => {
+  try {
+    const [totalProducts, lastProduct] = await Promise.all([
+      Product.countDocuments(),
+      Product.findOne().sort({ updatedAt: -1 }).select({ updatedAt: 1, _id: 0 }),
+    ]);
+
+    return res.json({
+      totalProducts,
+      lastUpdatedAt: lastProduct?.updatedAt ?? null,
+      version: `${totalProducts}-${lastProduct?.updatedAt ? new Date(lastProduct.updatedAt).toISOString() : 'none'}`,
+    });
+  } catch (error) {
+    return res.status(500).json({ error: 'Error al obtener versión de productos' });
   }
 });
 
