@@ -15,6 +15,10 @@ const productChangeLogSchema = new mongoose.Schema({
     type: String,
     default: '',
   },
+  adminUsername: {
+    type: String,
+    default: '',
+  },
   userAgent: {
     type: String,
     default: '',

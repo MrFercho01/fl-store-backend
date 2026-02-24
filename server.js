@@ -4,6 +4,8 @@ const cors = require('cors');
 const mongoose = require('mongoose');
 const multer = require('multer');
 const rateLimit = require('express-rate-limit');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
 const cloudinary = require('cloudinary').v2;
 const nodemailer = require('nodemailer');
 const fs = require('fs');
@@ -23,6 +25,8 @@ const MOBILE_DOWNLOADS_DIR = path.resolve(__dirname, 'downloads');
 const MOBILE_APK_FILE_NAME = path.basename(String(process.env.MOBILE_APK_FILE_NAME || 'fl-store-mobile.apk').trim() || 'fl-store-mobile.apk');
 const MOBILE_APK_FILE_PATH = path.join(MOBILE_DOWNLOADS_DIR, MOBILE_APK_FILE_NAME);
 const ECUADOR_TIMEZONE = 'America/Guayaquil';
+const ADMIN_JWT_SECRET = String(process.env.ADMIN_JWT_SECRET || '').trim();
+const ADMIN_TOKEN_EXPIRES_IN = String(process.env.ADMIN_TOKEN_EXPIRES_IN || '12h').trim();
 
 app.set('trust proxy', 1);
 
@@ -572,6 +576,21 @@ const normalizeIp = (value) => {
   return withoutPort.toLowerCase();
 };
 
+const ADMIN_IP_WHITELIST = new Set(
+  String(process.env.ADMIN_IP_WHITELIST || '')
+    .split(',')
+    .map((item) => normalizeIp(item))
+    .filter(Boolean)
+);
+const ADMIN_IP_PREFIX_WHITELIST = [
+  ...new Set(
+    String(process.env.ADMIN_IP_PREFIX_WHITELIST || '')
+      .split(',')
+      .map((item) => normalizeIp(item))
+      .filter(Boolean)
+  ),
+];
+
 const TRACKED_PRODUCT_FIELDS = ['name', 'description', 'price', 'category', 'image', 'isNew', 'isEnabled'];
 
 const toComparableValue = (value) => {
@@ -604,10 +623,73 @@ const registerProductChangeLog = async ({ productId, operation, req, changedFiel
     productId: String(productId),
     operation,
     ipAddress: getClientIp(req),
+    adminUsername: String(req.adminUser?.username || ''),
     userAgent: String(req.headers['user-agent'] || '').slice(0, 255),
     changedFields,
     productSnapshot,
   });
+};
+
+const getBearerToken = (req) => {
+  const authHeader = String(req.headers.authorization || '').trim();
+  if (!authHeader.toLowerCase().startsWith('bearer ')) return '';
+  return authHeader.slice(7).trim();
+};
+
+const isAdminIpAllowed = (ipAddress) => {
+  if (ADMIN_IP_WHITELIST.size === 0 && ADMIN_IP_PREFIX_WHITELIST.length === 0) {
+    return true;
+  }
+
+  const normalizedIp = normalizeIp(ipAddress);
+  if (!normalizedIp) return false;
+  if (ADMIN_IP_WHITELIST.has(normalizedIp)) return true;
+  return ADMIN_IP_PREFIX_WHITELIST.some((prefix) => normalizedIp.startsWith(prefix));
+};
+
+const requireAdminAuth = (req, res, next) => {
+  if (!ADMIN_JWT_SECRET) {
+    return res.status(500).json({ error: 'ADMIN_JWT_SECRET no configurado en el servidor' });
+  }
+
+  const token = getBearerToken(req);
+  if (!token) {
+    return res.status(401).json({ error: 'No autorizado. Token requerido.' });
+  }
+
+  if (!isAdminIpAllowed(getClientIp(req))) {
+    return res.status(403).json({ error: 'Acceso admin denegado para esta IP' });
+  }
+
+  try {
+    const payload = jwt.verify(token, ADMIN_JWT_SECRET);
+    req.adminUser = {
+      username: String(payload?.username || ''),
+    };
+    return next();
+  } catch (error) {
+    return res.status(401).json({ error: 'Sesión inválida o expirada. Inicia sesión nuevamente.' });
+  }
+};
+
+const isBcryptHash = (value) => /^\$2[aby]\$\d{2}\$/.test(String(value || ''));
+
+const verifyAndUpgradePassword = async (user, rawPassword) => {
+  const savedPassword = String(user?.password || '');
+  const candidate = String(rawPassword || '');
+  if (!savedPassword || !candidate) return false;
+
+  if (isBcryptHash(savedPassword)) {
+    return bcrypt.compare(candidate, savedPassword);
+  }
+
+  if (savedPassword !== candidate) {
+    return false;
+  }
+
+  const hashedPassword = await bcrypt.hash(candidate, 12);
+  await User.updateOne({ _id: user._id }, { $set: { password: hashedPassword } });
+  return true;
 };
 
 const escapeRegex = (value) => String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -755,9 +837,13 @@ mongoose.connect(MONGODB_URI)
     // Inicializar usuario admin si no existe
     const userCount = await User.countDocuments();
     if (userCount === 0) {
+      const seedUsername = String(process.env.ADMIN_SEED_USERNAME || 'MrFercho').trim();
+      const seedPassword = String(process.env.ADMIN_SEED_PASSWORD || '1623Fercho').trim();
+      const hashedPassword = await bcrypt.hash(seedPassword, 12);
+
       await User.create({
-        username: 'MrFercho',
-        password: '1623Fercho'
+        username: seedUsername,
+        password: hashedPassword,
       });
       console.log('✅ Usuario admin creado');
     }
@@ -857,7 +943,7 @@ app.post('/api/metrics/visit', visitRegisterLimiter, async (req, res) => {
 });
 
 // Métricas admin de visitas
-app.get('/api/metrics/admin', async (req, res) => {
+app.get('/api/metrics/admin', requireAdminAuth, async (req, res) => {
   try {
     const payload = await buildAdminMetricsPayload();
     return res.json(payload);
@@ -867,7 +953,7 @@ app.get('/api/metrics/admin', async (req, res) => {
 });
 
 // Recalcular métricas históricas y clasificación de visitas internas
-app.post('/api/metrics/admin/recalculate', async (req, res) => {
+app.post('/api/metrics/admin/recalculate', requireAdminAuth, async (req, res) => {
   try {
     const internalIpConditions = buildInternalIpConditions();
 
@@ -943,7 +1029,7 @@ app.get('/api/products', async (req, res) => {
   }
 });
 
-app.get('/api/products/:id/audit', async (req, res) => {
+app.get('/api/products/:id/audit', requireAdminAuth, async (req, res) => {
   try {
     const auditLogs = await ProductChangeLog.find({ productId: req.params.id })
       .sort({ createdAt: -1 });
@@ -1003,7 +1089,7 @@ app.delete('/api/mobile/push-token', async (req, res) => {
   }
 });
 
-app.post('/api/mobile/push/test', async (req, res) => {
+app.post('/api/mobile/push/test', requireAdminAuth, async (req, res) => {
   try {
     const title = String(req.body?.title || '🔔 Prueba de notificaciones').trim();
     const body = String(req.body?.body || 'Notificación de prueba FL Store').trim();
@@ -1029,7 +1115,7 @@ app.post('/api/mobile/push/test', async (req, res) => {
   }
 });
 
-app.get('/api/mobile/push/stats', async (req, res) => {
+app.get('/api/mobile/push/stats', requireAdminAuth, async (req, res) => {
   try {
     const [totalTokens, activeTokens, androidActive, iosActive, webActive] = await Promise.all([
       MobilePushToken.countDocuments(),
@@ -1058,7 +1144,7 @@ app.get('/api/mobile/push/stats', async (req, res) => {
   }
 });
 
-app.post('/api/mobile/apk-downloads/recalculate', async (req, res) => {
+app.post('/api/mobile/apk-downloads/recalculate', requireAdminAuth, async (req, res) => {
   try {
     const totalUniqueDownloads = await MobileApkDownload.countDocuments();
 
@@ -1109,7 +1195,7 @@ app.get('/api/products/version', async (req, res) => {
 });
 
 // Crear producto
-app.post('/api/products', async (req, res) => {
+app.post('/api/products', requireAdminAuth, async (req, res) => {
   try {
     const newProduct = await Product.create({
       id: Date.now().toString(),
@@ -1139,7 +1225,7 @@ app.post('/api/products', async (req, res) => {
 });
 
 // Actualizar producto
-app.put('/api/products/:id', async (req, res) => {
+app.put('/api/products/:id', requireAdminAuth, async (req, res) => {
   try {
     const existingProduct = await Product.findOne({ id: req.params.id });
     if (!existingProduct) {
@@ -1214,7 +1300,7 @@ app.put('/api/products/:id', async (req, res) => {
 });
 
 // Eliminar producto
-app.delete('/api/products/:id', async (req, res) => {
+app.delete('/api/products/:id', requireAdminAuth, async (req, res) => {
   try {
     const product = await Product.findOneAndDelete({ id: req.params.id });
     if (product) {
@@ -1235,7 +1321,7 @@ app.delete('/api/products/:id', async (req, res) => {
 });
 
 // Subir imagen a Cloudinary
-app.post('/api/upload', upload.single('image'), async (req, res) => {
+app.post('/api/upload', requireAdminAuth, upload.single('image'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ error: 'No se recibió ninguna imagen' });
@@ -1266,10 +1352,28 @@ app.post('/api/upload', upload.single('image'), async (req, res) => {
 // Login
 app.post('/api/login', loginLimiter, async (req, res) => {
   try {
-    const { username, password } = req.body;
-    const user = await User.findOne({ username, password });
-    if (user) {
-      res.json({ success: true, message: 'Login exitoso' });
+    if (!ADMIN_JWT_SECRET) {
+      return res.status(500).json({ success: false, error: 'ADMIN_JWT_SECRET no configurado en backend' });
+    }
+
+    const username = String(req.body?.username || '').trim();
+    const password = String(req.body?.password || '');
+    const user = await User.findOne({ username });
+    const isValidPassword = await verifyAndUpgradePassword(user, password);
+
+    if (user && isValidPassword) {
+      const token = jwt.sign(
+        { username: String(user.username || '') },
+        ADMIN_JWT_SECRET,
+        { expiresIn: ADMIN_TOKEN_EXPIRES_IN }
+      );
+
+      res.json({
+        success: true,
+        message: 'Login exitoso',
+        token,
+        expiresIn: ADMIN_TOKEN_EXPIRES_IN,
+      });
     } else {
       res.status(401).json({ success: false, error: 'Credenciales incorrectas' });
     }
@@ -1411,7 +1515,7 @@ app.patch('/api/reviews/:id/like', reviewLikeLimiter, validateLikeCooldown, asyn
 });
 
 // Obtener reseñas para panel admin
-app.get('/api/reviews/admin', async (req, res) => {
+app.get('/api/reviews/admin', requireAdminAuth, async (req, res) => {
   try {
     const reviews = await Review.find().sort({ createdAt: -1 });
     res.json(reviews);
@@ -1421,7 +1525,7 @@ app.get('/api/reviews/admin', async (req, res) => {
 });
 
 // Cambiar estado de reseña (aprobar/rechazar)
-app.patch('/api/reviews/:id/status', async (req, res) => {
+app.patch('/api/reviews/:id/status', requireAdminAuth, async (req, res) => {
   try {
     const { status } = req.body;
     if (!['approved', 'rejected', 'pending'].includes(status)) {
