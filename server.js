@@ -289,6 +289,20 @@ const notifyProductPriceUpdated = async ({ product, previousPrice }) => {
   });
 };
 
+const notifyProductUpdated = async (product) => {
+  const title = '🛍️ Producto actualizado en FL Store';
+  const body = `${product.name} fue actualizado. Revisa los cambios en la app.`;
+
+  return sendExpoPushNotificationToAll({
+    title,
+    body,
+    data: {
+      type: 'product_update',
+      productId: product.id,
+    },
+  });
+};
+
 const isValidEmail = (value) => {
   const normalized = String(value || '').trim();
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalized);
@@ -1096,12 +1110,30 @@ app.put('/api/products/:id', async (req, res) => {
     }
 
     const updatedPrice = Number(product.price);
-    if (Number.isFinite(previousPrice) && Number.isFinite(updatedPrice) && previousPrice !== updatedPrice) {
+    const priceChanged = Number.isFinite(previousPrice) && Number.isFinite(updatedPrice) && previousPrice !== updatedPrice;
+    const hasAnyChange = [
+      String(existingProduct.name || '').trim() !== String(product.name || '').trim(),
+      String(existingProduct.description || '').trim() !== String(product.description || '').trim(),
+      String(existingProduct.category || '').trim() !== String(product.category || '').trim(),
+      String(existingProduct.image || '').trim() !== String(product.image || '').trim(),
+      Boolean(existingProduct.isNew) !== Boolean(product.isNew),
+      Boolean(existingProduct.isEnabled !== false) !== Boolean(product.isEnabled !== false),
+      priceChanged,
+    ].some(Boolean);
+
+    if (priceChanged) {
       try {
         const pushResult = await notifyProductPriceUpdated({ product, previousPrice });
         console.log(`📲 Push cambio de precio enviado. delivered=${pushResult.delivered} invalidated=${pushResult.invalidated}`);
       } catch (pushError) {
         console.error('❌ Error enviando push de cambio de precio:', pushError?.message || 'Sin detalle');
+      }
+    } else if (hasAnyChange) {
+      try {
+        const pushResult = await notifyProductUpdated(product);
+        console.log(`📲 Push actualización de producto enviado. delivered=${pushResult.delivered} invalidated=${pushResult.invalidated}`);
+      } catch (pushError) {
+        console.error('❌ Error enviando push de actualización de producto:', pushError?.message || 'Sin detalle');
       }
     }
 
