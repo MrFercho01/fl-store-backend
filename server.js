@@ -15,6 +15,7 @@ const SiteMetric = require('./models/SiteMetric');
 const SiteVisit = require('./models/SiteVisit');
 const MobilePushToken = require('./models/MobilePushToken');
 const MobileApkDownload = require('./models/MobileApkDownload');
+const ProductChangeLog = require('./models/ProductChangeLog');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -571,6 +572,44 @@ const normalizeIp = (value) => {
   return withoutPort.toLowerCase();
 };
 
+const TRACKED_PRODUCT_FIELDS = ['name', 'description', 'price', 'category', 'image', 'isNew', 'isEnabled'];
+
+const toComparableValue = (value) => {
+  if (value === null || value === undefined) return null;
+  if (typeof value === 'string') return value.trim();
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  if (typeof value === 'boolean') return value;
+  if (value instanceof Date) return value.toISOString();
+  return value;
+};
+
+const buildProductFieldDiff = (beforeProduct, afterProduct) => {
+  return TRACKED_PRODUCT_FIELDS
+    .map((field) => {
+      const beforeValue = toComparableValue(beforeProduct?.[field]);
+      const afterValue = toComparableValue(afterProduct?.[field]);
+      if (Object.is(beforeValue, afterValue)) return null;
+      return {
+        field,
+        from: beforeValue,
+        to: afterValue,
+      };
+    })
+    .filter(Boolean);
+};
+
+const registerProductChangeLog = async ({ productId, operation, req, changedFields = [], productSnapshot = null }) => {
+  if (!productId || !operation) return;
+  await ProductChangeLog.create({
+    productId: String(productId),
+    operation,
+    ipAddress: getClientIp(req),
+    userAgent: String(req.headers['user-agent'] || '').slice(0, 255),
+    changedFields,
+    productSnapshot,
+  });
+};
+
 const escapeRegex = (value) => String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 const INTERNAL_IP_WHITELIST = new Set(
@@ -904,6 +943,17 @@ app.get('/api/products', async (req, res) => {
   }
 });
 
+app.get('/api/products/:id/audit', async (req, res) => {
+  try {
+    const auditLogs = await ProductChangeLog.find({ productId: req.params.id })
+      .sort({ createdAt: -1 });
+
+    return res.json(auditLogs);
+  } catch (error) {
+    return res.status(500).json({ error: 'Error al obtener trazabilidad del producto' });
+  }
+});
+
 // Registrar token push de app móvil
 app.post('/api/mobile/push-token', async (req, res) => {
   try {
@@ -1067,6 +1117,14 @@ app.post('/api/products', async (req, res) => {
       ...req.body
     });
 
+    await registerProductChangeLog({
+      productId: newProduct.id,
+      operation: 'create',
+      req,
+      changedFields: buildProductFieldDiff(null, newProduct),
+      productSnapshot: newProduct.toObject(),
+    });
+
     try {
       const pushResult = await notifyProductCreated(newProduct);
       console.log(`📲 Push nuevo producto enviado. delivered=${pushResult.delivered} invalidated=${pushResult.invalidated}`);
@@ -1109,6 +1167,18 @@ app.put('/api/products/:id', async (req, res) => {
       return res.status(404).json({ error: 'Producto no encontrado' });
     }
 
+    const changedFields = buildProductFieldDiff(existingProduct, product);
+
+    if (changedFields.length > 0) {
+      await registerProductChangeLog({
+        productId: product.id,
+        operation: 'update',
+        req,
+        changedFields,
+        productSnapshot: product.toObject(),
+      });
+    }
+
     const updatedPrice = Number(product.price);
     const priceChanged = Number.isFinite(previousPrice) && Number.isFinite(updatedPrice) && previousPrice !== updatedPrice;
     const hasAnyChange = [
@@ -1148,6 +1218,13 @@ app.delete('/api/products/:id', async (req, res) => {
   try {
     const product = await Product.findOneAndDelete({ id: req.params.id });
     if (product) {
+      await registerProductChangeLog({
+        productId: product.id,
+        operation: 'delete',
+        req,
+        changedFields: buildProductFieldDiff(product, null),
+        productSnapshot: product.toObject(),
+      });
       res.json({ message: 'Producto eliminado' });
     } else {
       res.status(404).json({ error: 'Producto no encontrado' });
