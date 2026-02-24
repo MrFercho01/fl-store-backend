@@ -265,8 +265,8 @@ const sendExpoPushNotificationToAll = async ({ title, body, data = {} }) => {
 };
 
 const notifyProductCreated = async (product) => {
-  const title = '🆕 NUEVO! Producto en la tienda FL Store';
-  const body = `🔥 Descubre ${product.name} antes que todos. ¡Disponible ahora!`;
+  const title = '🆕 ¡Nuevos productos en nuestra tienda!';
+  const body = `Llegó ${product.name} 🔥 Aprovecha y cómpralo antes que se agote.`;
 
   return sendExpoPushNotificationToAll({
     title,
@@ -279,8 +279,8 @@ const notifyProductCreated = async (product) => {
 };
 
 const notifyProductPriceUpdated = async ({ product, previousPrice }) => {
-  const title = '💥 OFERTA! 💸 Precio actualizado';
-  const body = `Aprovecha ${product.name} por solo $${Number(product.price).toFixed(2)} (antes $${Number(previousPrice).toFixed(2)}). ¡Por tiempo limitado!`;
+  const title = '💥 ¡OFERTA IMPERDIBLE!';
+  const body = `${product.name} ahora a $${Number(product.price).toFixed(2)} (antes $${Number(previousPrice).toFixed(2)}). ¡Llévalo hoy!`;
 
   return sendExpoPushNotificationToAll({
     title,
@@ -295,14 +295,42 @@ const notifyProductPriceUpdated = async ({ product, previousPrice }) => {
 };
 
 const notifyProductUpdated = async (product) => {
-  const title = '🛍️ Producto actualizado en FL Store';
-  const body = `${product.name} fue actualizado. Revisa los cambios en la app.`;
+  const title = '✨ ¡Producto mejorado en FL Store!';
+  const body = `${product.name} tiene novedades. Entra y descúbrelas ahora.`;
 
   return sendExpoPushNotificationToAll({
     title,
     body,
     data: {
       type: 'product_update',
+      productId: product.id,
+    },
+  });
+};
+
+const notifyProductEnabled = async (product) => {
+  const title = '✅ ¡Vuelve a estar disponible!';
+  const body = `${product.name} regresó a nuestra tienda. ¡Aprovecha antes que se termine!`;
+
+  return sendExpoPushNotificationToAll({
+    title,
+    body,
+    data: {
+      type: 'new_product',
+      productId: product.id,
+    },
+  });
+};
+
+const notifyProductDisabled = async (product) => {
+  const title = '⚠️ Producto temporalmente sin stock';
+  const body = `${product.name}: este producto no hay en stock por el momento.`;
+
+  return sendExpoPushNotificationToAll({
+    title,
+    body,
+    data: {
+      type: 'product_disabled',
       productId: product.id,
     },
   });
@@ -1239,6 +1267,7 @@ app.put('/api/products/:id', requireAdminAuth, async (req, res) => {
     }
 
     const previousPrice = Number(existingProduct.price);
+    const previousEnabled = existingProduct.isEnabled !== false;
 
     const updates = {
       ...req.body,
@@ -1272,6 +1301,8 @@ app.put('/api/products/:id', requireAdminAuth, async (req, res) => {
     }
 
     const updatedPrice = Number(product.price);
+    const currentEnabled = product.isEnabled !== false;
+    const enabledChanged = previousEnabled !== currentEnabled;
     const priceChanged = Number.isFinite(previousPrice) && Number.isFinite(updatedPrice) && previousPrice !== updatedPrice;
     const hasAnyChange = [
       String(existingProduct.name || '').trim() !== String(product.name || '').trim(),
@@ -1283,7 +1314,21 @@ app.put('/api/products/:id', requireAdminAuth, async (req, res) => {
       priceChanged,
     ].some(Boolean);
 
-    if (priceChanged) {
+    if (enabledChanged && currentEnabled) {
+      try {
+        const pushResult = await notifyProductEnabled(product);
+        console.log(`📲 Push producto habilitado enviado. delivered=${pushResult.delivered} invalidated=${pushResult.invalidated}`);
+      } catch (pushError) {
+        console.error('❌ Error enviando push de producto habilitado:', pushError?.message || 'Sin detalle');
+      }
+    } else if (enabledChanged && !currentEnabled) {
+      try {
+        const pushResult = await notifyProductDisabled(product);
+        console.log(`📲 Push producto deshabilitado enviado. delivered=${pushResult.delivered} invalidated=${pushResult.invalidated}`);
+      } catch (pushError) {
+        console.error('❌ Error enviando push de producto deshabilitado:', pushError?.message || 'Sin detalle');
+      }
+    } else if (priceChanged) {
       try {
         const pushResult = await notifyProductPriceUpdated({ product, previousPrice });
         console.log(`📲 Push cambio de precio enviado. delivered=${pushResult.delivered} invalidated=${pushResult.invalidated}`);
@@ -1317,6 +1362,7 @@ app.delete('/api/products/:id', requireAdminAuth, async (req, res) => {
         changedFields: buildProductFieldDiff(product, null),
         productSnapshot: product.toObject(),
       });
+
       res.json({ message: 'Producto eliminado' });
     } else {
       res.status(404).json({ error: 'Producto no encontrado' });
