@@ -46,6 +46,40 @@ const reviewSchema = new mongoose.Schema({
     enum: ['pending', 'approved', 'rejected'],
     default: 'pending',
   },
+  createdFromIp: {
+    type: String,
+    default: '',
+  },
+  createdFromUserAgent: {
+    type: String,
+    default: '',
+  },
+  moderationHistory: {
+    type: [{
+      status: {
+        type: String,
+        enum: ['pending', 'approved', 'rejected'],
+        required: true,
+      },
+      changedBy: {
+        type: String,
+        default: '',
+      },
+      ipAddress: {
+        type: String,
+        default: '',
+      },
+      userAgent: {
+        type: String,
+        default: '',
+      },
+      changedAt: {
+        type: Date,
+        default: Date.now,
+      },
+    }],
+    default: [],
+  },
 }, {
   timestamps: true,
 });

@@ -32,9 +32,9 @@ app.set('trust proxy', 1);
 
 // Configurar Cloudinary
 cloudinary.config({
-  cloud_name: process.env.CLOUDINARY_CLOUD_NAME || 'dg3e6buy5',
-  api_key: process.env.CLOUDINARY_API_KEY || '368337259342651',
-  api_secret: process.env.CLOUDINARY_API_SECRET || 'b-9OsvrOuumqaC9rJ9yxzNH354E'
+  cloud_name: String(process.env.CLOUDINARY_CLOUD_NAME || '').trim(),
+  api_key: String(process.env.CLOUDINARY_API_KEY || '').trim(),
+  api_secret: String(process.env.CLOUDINARY_API_SECRET || '').trim(),
 });
 
 // Middleware
@@ -837,8 +837,14 @@ mongoose.connect(MONGODB_URI)
     // Inicializar usuario admin si no existe
     const userCount = await User.countDocuments();
     if (userCount === 0) {
-      const seedUsername = String(process.env.ADMIN_SEED_USERNAME || 'MrFercho').trim();
-      const seedPassword = String(process.env.ADMIN_SEED_PASSWORD || '1623Fercho').trim();
+      const seedUsername = String(process.env.ADMIN_SEED_USERNAME || '').trim();
+      const seedPassword = String(process.env.ADMIN_SEED_PASSWORD || '').trim();
+
+      if (!seedUsername || !seedPassword) {
+        console.warn('⚠️ No se creó usuario admin inicial: define ADMIN_SEED_USERNAME y ADMIN_SEED_PASSWORD');
+        return;
+      }
+
       const hashedPassword = await bcrypt.hash(seedPassword, 12);
 
       await User.create({
@@ -1323,6 +1329,16 @@ app.delete('/api/products/:id', requireAdminAuth, async (req, res) => {
 // Subir imagen a Cloudinary
 app.post('/api/upload', requireAdminAuth, upload.single('image'), async (req, res) => {
   try {
+    const hasCloudinaryConfig = Boolean(
+      String(process.env.CLOUDINARY_CLOUD_NAME || '').trim()
+      && String(process.env.CLOUDINARY_API_KEY || '').trim()
+      && String(process.env.CLOUDINARY_API_SECRET || '').trim()
+    );
+
+    if (!hasCloudinaryConfig) {
+      return res.status(500).json({ error: 'Cloudinary no está configurado en el servidor' });
+    }
+
     if (!req.file) {
       return res.status(400).json({ error: 'No se recibió ninguna imagen' });
     }
@@ -1396,6 +1412,9 @@ app.post('/api/reviews', reviewCreationLimiter, async (req, res) => {
       return res.status(400).json({ error: 'La calificación debe estar entre 1 y 5' });
     }
 
+    const ipAddress = getClientIp(req);
+    const userAgent = String(req.headers['user-agent'] || '').slice(0, 255);
+
     const review = await Review.create({
       customerName: String(customerName).trim(),
       productId: String(productId).trim(),
@@ -1405,6 +1424,15 @@ app.post('/api/reviews', reviewCreationLimiter, async (req, res) => {
       comment: String(comment).trim(),
       recommend: Boolean(recommend),
       status: 'pending',
+      createdFromIp: ipAddress,
+      createdFromUserAgent: userAgent,
+      moderationHistory: [{
+        status: 'pending',
+        changedBy: 'system',
+        ipAddress,
+        userAgent,
+        changedAt: new Date(),
+      }],
     });
 
     await sendReviewNotificationEmail(review);
@@ -1418,25 +1446,15 @@ app.post('/api/reviews', reviewCreationLimiter, async (req, res) => {
   }
 });
 
-// Obtener reseñas públicas (2 mejores + 2 más bajas) y métricas
+// Obtener reseñas públicas aprobadas y métricas
 app.get('/api/reviews/public', async (req, res) => {
   try {
     const visitorId = String(req.query.visitorId || '').trim();
 
-    const topRated = await Review.find({ status: 'approved' })
-      .sort({ rating: -1, createdAt: -1 })
-      .limit(2);
+    const approvedReviews = await Review.find({ status: 'approved' })
+      .sort({ createdAt: -1 });
 
-    const lowRated = await Review.find({ status: 'approved' })
-      .sort({ rating: 1, createdAt: -1 })
-      .limit(2);
-
-    const mergedMap = new Map();
-    [...topRated, ...lowRated].forEach((item) => {
-      mergedMap.set(String(item._id), item);
-    });
-
-    const selectedReviews = Array.from(mergedMap.values()).map((review) => {
+    const publicReviews = approvedReviews.map((review) => {
       const visitorLikes = Array.isArray(review.visitorLikes) ? review.visitorLikes : [];
       return {
         ...review.toObject(),
@@ -1467,7 +1485,7 @@ app.get('/api/reviews/public', async (req, res) => {
     const stats = approvedStats[0] || { totalReviews: 0, averageRating: 0, totalLikes: 0 };
 
     res.json({
-      reviews: selectedReviews,
+      reviews: publicReviews,
       stats: {
         totalReviews: stats.totalReviews,
         averageRating: Number(stats.averageRating || 0),
@@ -1532,9 +1550,24 @@ app.patch('/api/reviews/:id/status', requireAdminAuth, async (req, res) => {
       return res.status(400).json({ error: 'Estado inválido' });
     }
 
+    const ipAddress = getClientIp(req);
+    const userAgent = String(req.headers['user-agent'] || '').slice(0, 255);
+    const adminUsername = String(req.adminUser?.username || '').trim() || 'admin';
+
     const review = await Review.findByIdAndUpdate(
       req.params.id,
-      { status },
+      {
+        $set: { status },
+        $push: {
+          moderationHistory: {
+            status,
+            changedBy: adminUsername,
+            ipAddress,
+            userAgent,
+            changedAt: new Date(),
+          },
+        },
+      },
       { new: true }
     );
 
