@@ -1007,7 +1007,12 @@ app.post('/api/products', async (req, res) => {
       ...req.body
     });
 
-    void notifyProductCreated(newProduct);
+    try {
+      const pushResult = await notifyProductCreated(newProduct);
+      console.log(`📲 Push nuevo producto enviado. delivered=${pushResult.delivered} invalidated=${pushResult.invalidated}`);
+    } catch (pushError) {
+      console.error('❌ Error enviando push de nuevo producto:', pushError?.message || 'Sin detalle');
+    }
 
     res.status(201).json(newProduct);
   } catch (error) {
@@ -1046,7 +1051,12 @@ app.put('/api/products/:id', async (req, res) => {
 
     const updatedPrice = Number(product.price);
     if (Number.isFinite(previousPrice) && Number.isFinite(updatedPrice) && previousPrice !== updatedPrice) {
-      void notifyProductPriceUpdated({ product, previousPrice });
+      try {
+        const pushResult = await notifyProductPriceUpdated({ product, previousPrice });
+        console.log(`📲 Push cambio de precio enviado. delivered=${pushResult.delivered} invalidated=${pushResult.invalidated}`);
+      } catch (pushError) {
+        console.error('❌ Error enviando push de cambio de precio:', pushError?.message || 'Sin detalle');
+      }
     }
 
     res.json(product);
