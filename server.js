@@ -14,6 +14,7 @@ const Review = require('./models/Review');
 const SiteMetric = require('./models/SiteMetric');
 const SiteVisit = require('./models/SiteVisit');
 const MobilePushToken = require('./models/MobilePushToken');
+const MobileApkDownload = require('./models/MobileApkDownload');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -103,14 +104,34 @@ app.get('/downloads/fl-store-mobile.apk', async (req, res) => {
       });
     }
 
-    await SiteMetric.findOneAndUpdate(
-      { key: 'mobile_apk_downloads' },
-      { $inc: { value: 1 } },
-      { upsert: true, new: true, setDefaultsOnInsert: true }
-    );
-
     res.setHeader('Content-Type', 'application/vnd.android.package-archive');
     res.setHeader('Content-Disposition', `attachment; filename="${MOBILE_APK_FILE_NAME}"`);
+
+    if (req.method === 'HEAD') {
+      return res.status(200).end();
+    }
+
+    const dayKey = getDayKey();
+    const ipAddress = getClientIp(req);
+    const userAgent = String(req.headers['user-agent'] || '').slice(0, 255);
+    const downloadFingerprint = `${dayKey}|${normalizeIp(ipAddress) || 'unknown'}|${userAgent || 'unknown'}`;
+
+    const existingDownload = await MobileApkDownload.exists({ fingerprint: downloadFingerprint });
+    if (!existingDownload) {
+      await MobileApkDownload.create({
+        dayKey,
+        ipAddress,
+        userAgent,
+        fingerprint: downloadFingerprint,
+      });
+
+      await SiteMetric.findOneAndUpdate(
+        { key: 'mobile_apk_downloads' },
+        { $inc: { value: 1 } },
+        { upsert: true, new: true, setDefaultsOnInsert: true }
+      );
+    }
+
     return res.sendFile(MOBILE_APK_FILE_PATH);
   } catch (error) {
     return res.status(500).json({ error: 'Error al preparar descarga del APK' });
@@ -944,6 +965,25 @@ app.post('/api/mobile/push/test', async (req, res) => {
   }
 });
 
+app.post('/api/mobile/apk-downloads/recalculate', async (req, res) => {
+  try {
+    const totalUniqueDownloads = await MobileApkDownload.countDocuments();
+
+    await SiteMetric.findOneAndUpdate(
+      { key: 'mobile_apk_downloads' },
+      { $set: { value: totalUniqueDownloads } },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+
+    return res.json({
+      message: 'Contador de descargas APK recalculado correctamente',
+      downloadCount: totalUniqueDownloads,
+    });
+  } catch (error) {
+    return res.status(500).json({ error: 'Error al recalcular descargas APK' });
+  }
+});
+
 // Obtener un producto por ID
 app.get('/api/products/:id', async (req, res) => {
   try {
@@ -963,6 +1003,7 @@ app.post('/api/products', async (req, res) => {
   try {
     const newProduct = await Product.create({
       id: Date.now().toString(),
+      isEnabled: req.body?.isEnabled !== false,
       ...req.body
     });
 
@@ -984,9 +1025,18 @@ app.put('/api/products/:id', async (req, res) => {
 
     const previousPrice = Number(existingProduct.price);
 
+    const updates = {
+      ...req.body,
+      id: req.params.id,
+    };
+
+    if (typeof req.body?.isEnabled !== 'boolean') {
+      updates.isEnabled = existingProduct.isEnabled !== false;
+    }
+
     const product = await Product.findOneAndUpdate(
       { id: req.params.id },
-      { ...req.body, id: req.params.id },
+      updates,
       { new: true }
     );
 
