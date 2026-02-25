@@ -8,6 +8,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const cloudinary = require('cloudinary').v2;
 const nodemailer = require('nodemailer');
+const { randomUUID } = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const Product = require('./models/Product');
@@ -42,6 +43,12 @@ cloudinary.config({
 // Middleware
 app.use(cors());
 app.use(express.json());
+app.use((req, res, next) => {
+  const requestId = randomUUID().replace(/-/g, '').slice(0, 12);
+  req.requestId = requestId;
+  res.setHeader('x-request-id', requestId);
+  next();
+});
 
 const createLimiter = ({ windowMs, max, message }) => {
   return rateLimit({
@@ -767,13 +774,14 @@ const requireAdminAuth = (req, res, next) => {
   }
 
   if (!ADMIN_IP_ENFORCE && !ipAllowed) {
+    const requestId = String(req.requestId || '').trim() || 'unknown';
     const normalizedClientIp = normalizeIp(clientIp) || 'unknown';
     const requestMethod = String(req.method || 'UNKNOWN').toUpperCase();
     const requestPath = String(req.originalUrl || req.url || '').slice(0, 180) || '/';
     const userAgent = String(req.headers['user-agent'] || '').slice(0, 220) || 'unknown';
 
     console.warn(
-      `⚠️ Admin request desde IP fuera de whitelist permitida por ADMIN_IP_ENFORCE=false: ip=${normalizedClientIp} route=${requestMethod} ${requestPath} ua="${userAgent}"`
+      `⚠️ Admin request desde IP fuera de whitelist permitida por ADMIN_IP_ENFORCE=false: requestId=${requestId} ip=${normalizedClientIp} route=${requestMethod} ${requestPath} ua="${userAgent}"`
     );
   }
 
