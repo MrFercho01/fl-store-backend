@@ -1,10 +1,10 @@
 {
   "aliasFile": "fl-store-mobile.apk",
-  "versionedFile": "fl-store-mobile-v1.0.0+1-20260225-115437.apk",
+  "versionedFile": "fl-store-mobile-v1.0.0+1-20260225-124206.apk",
   "versionName": "1.0.0",
   "versionCode": 1,
-  "buildId": "20260225-115437",
-  "sha256": "4a34ec9879d7e74d8add263724fb59eb78419abceb667f78cc25ca1167b0155f",
-  "sizeBytes": 66815135,
-  "createdAt": "2026-02-25T16:54:41Z"
+  "buildId": "20260225-124206",
+  "sha256": "f9742b0d351299a75fbd9fc92ba922a4b5c331fe8a23b9fe9f719a3b7ccd6ea5",
+  "sizeBytes": 66815271,
+  "createdAt": "2026-02-25T17:42:09Z"
 }
