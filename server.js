@@ -1279,7 +1279,11 @@ app.post('/api/mobile/apk-downloads/recalculate', requireAdminAuth, async (req, 
 });
 
 // Obtener un producto por ID
-app.get('/api/products/:id', async (req, res) => {
+app.get('/api/products/:id', async (req, res, next) => {
+  if (String(req.params.id || '').trim().toLowerCase() === 'version') {
+    return next();
+  }
+
   try {
     const product = await Product.findOne({ id: req.params.id });
     if (product) {
