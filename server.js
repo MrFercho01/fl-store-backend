@@ -22,6 +22,8 @@ const ProductChangeLog = require('./models/ProductChangeLog');
 const app = express();
 const PORT = process.env.PORT || 3000;
 const MOBILE_DOWNLOADS_DIR = path.resolve(__dirname, 'downloads');
+const MOBILE_RELEASES_DIR = path.join(MOBILE_DOWNLOADS_DIR, 'releases');
+const MOBILE_RELEASES_LATEST_PATH = path.join(MOBILE_RELEASES_DIR, 'latest.json');
 const MOBILE_APK_FILE_NAME = path.basename(String(process.env.MOBILE_APK_FILE_NAME || 'fl-store-mobile.apk').trim() || 'fl-store-mobile.apk');
 const MOBILE_APK_FILE_PATH = path.join(MOBILE_DOWNLOADS_DIR, MOBILE_APK_FILE_NAME);
 const ECUADOR_TIMEZONE = 'America/Guayaquil';
@@ -100,6 +102,20 @@ const validateLikeCooldown = (req, res, next) => {
 
 app.use('/api', apiLimiter);
 
+const getLatestApkMetadata = () => {
+  try {
+    if (!fs.existsSync(MOBILE_RELEASES_LATEST_PATH)) return null;
+
+    const raw = fs.readFileSync(MOBILE_RELEASES_LATEST_PATH, 'utf8');
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return null;
+
+    return parsed;
+  } catch (error) {
+    return null;
+  }
+};
+
 app.get('/downloads/fl-store-mobile.apk', async (req, res) => {
   try {
     if (!fs.existsSync(MOBILE_APK_FILE_PATH)) {
@@ -143,21 +159,78 @@ app.get('/downloads/fl-store-mobile.apk', async (req, res) => {
   }
 });
 
+app.get('/downloads/releases/:fileName', (req, res) => {
+  try {
+    const fileName = path.basename(String(req.params.fileName || '').trim());
+    if (!fileName.toLowerCase().endsWith('.apk')) {
+      return res.status(400).json({ error: 'Nombre de archivo APK inválido' });
+    }
+
+    const releaseFilePath = path.join(MOBILE_RELEASES_DIR, fileName);
+    if (!fs.existsSync(releaseFilePath)) {
+      return res.status(404).json({ error: 'APK versionado no encontrado' });
+    }
+
+    res.setHeader('Content-Type', 'application/vnd.android.package-archive');
+    res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+
+    if (req.method === 'HEAD') {
+      return res.status(200).end();
+    }
+
+    return res.sendFile(releaseFilePath);
+  } catch (error) {
+    return res.status(500).json({ error: 'Error al preparar descarga del APK versionado' });
+  }
+});
+
 app.get('/api/mobile/apk-info', async (req, res) => {
   try {
     const host = req.get('host');
     const protocol = req.protocol || 'http';
     const downloadUrl = `${protocol}://${host}/downloads/fl-store-mobile.apk`;
     const apkDownloadsMetric = await SiteMetric.findOne({ key: 'mobile_apk_downloads' });
+    const latestRelease = getLatestApkMetadata();
+    const versionedDownloadUrl = latestRelease?.versionedFile
+      ? `${protocol}://${host}/downloads/releases/${encodeURIComponent(String(latestRelease.versionedFile))}`
+      : null;
 
     return res.json({
       available: fs.existsSync(MOBILE_APK_FILE_PATH),
       fileName: MOBILE_APK_FILE_NAME,
       downloadUrl,
       downloadCount: Number(apkDownloadsMetric?.value ?? 0),
+      latestRelease: latestRelease || null,
+      versionedDownloadUrl,
     });
   } catch (error) {
     return res.status(500).json({ error: 'Error al obtener información de APK' });
+  }
+});
+
+app.get('/api/mobile/apk-releases', async (req, res) => {
+  try {
+    if (!fs.existsSync(MOBILE_RELEASES_DIR)) {
+      return res.json({ releases: [] });
+    }
+
+    const releases = fs.readdirSync(MOBILE_RELEASES_DIR)
+      .filter((item) => item.toLowerCase().endsWith('.apk'))
+      .map((fileName) => {
+        const filePath = path.join(MOBILE_RELEASES_DIR, fileName);
+        const stats = fs.statSync(filePath);
+
+        return {
+          fileName,
+          sizeBytes: Number(stats.size || 0),
+          createdAt: stats.mtime.toISOString(),
+        };
+      })
+      .sort((first, second) => new Date(second.createdAt).getTime() - new Date(first.createdAt).getTime());
+
+    return res.json({ releases });
+  } catch (error) {
+    return res.status(500).json({ error: 'Error al listar versiones de APK' });
   }
 });
 

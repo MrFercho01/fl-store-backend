@@ -41,7 +41,9 @@ npm start
 - POST `/api/upload` - Subir imagen a Cloudinary
 - POST `/api/login` - Login de admin
 - GET `/downloads/fl-store-mobile.apk` - Descargar APK Android local (si existe en `backend/downloads`)
+- GET `/downloads/releases/:fileName` - Descargar una versión específica del APK
 - GET `/api/mobile/apk-info` - Estado, URL y contador de descargas del APK
+- GET `/api/mobile/apk-releases` - Listar historial de APKs versionados
 - POST `/api/mobile/push/test` - Enviar notificación push de prueba a tokens activos
 
 ## APK local sin hosting externo
@@ -57,6 +59,22 @@ Opcional en `.env`:
 ```env
 MOBILE_APK_FILE_NAME=fl-store-mobile.apk
 ```
+
+## Versionamiento de APK (referencias)
+
+Al ejecutar en `fl-store-mobile`:
+
+```bash
+npm run build:android:apk
+```
+
+Se generan automáticamente:
+
+- Alias estable: `backend/downloads/fl-store-mobile.apk`
+- Copia versionada: `backend/downloads/releases/fl-store-mobile-v<versionName>+<versionCode>-<buildId>.apk`
+- Metadata de la última build: `backend/downloads/releases/latest.json`
+
+Esto permite mantener historial y referencias por versión sin romper el link principal de descarga.
 
 ## 💾 Base de Datos
 
