@@ -767,7 +767,14 @@ const requireAdminAuth = (req, res, next) => {
   }
 
   if (!ADMIN_IP_ENFORCE && !ipAllowed) {
-    console.warn(`⚠️ Admin login desde IP fuera de whitelist permitida por ADMIN_IP_ENFORCE=false: ${normalizeIp(clientIp) || 'unknown'}`);
+    const normalizedClientIp = normalizeIp(clientIp) || 'unknown';
+    const requestMethod = String(req.method || 'UNKNOWN').toUpperCase();
+    const requestPath = String(req.originalUrl || req.url || '').slice(0, 180) || '/';
+    const userAgent = String(req.headers['user-agent'] || '').slice(0, 220) || 'unknown';
+
+    console.warn(
+      `⚠️ Admin request desde IP fuera de whitelist permitida por ADMIN_IP_ENFORCE=false: ip=${normalizedClientIp} route=${requestMethod} ${requestPath} ua="${userAgent}"`
+    );
   }
 
   try {
