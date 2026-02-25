@@ -691,6 +691,7 @@ const ADMIN_IP_PREFIX_WHITELIST = [
       .filter(Boolean)
   ),
 ];
+const ADMIN_IP_ENFORCE = parseBooleanEnv(process.env.ADMIN_IP_ENFORCE) === true;
 
 const TRACKED_PRODUCT_FIELDS = ['name', 'description', 'price', 'category', 'image', 'isNew', 'isEnabled'];
 
@@ -758,8 +759,15 @@ const requireAdminAuth = (req, res, next) => {
     return res.status(401).json({ error: 'No autorizado. Token requerido.' });
   }
 
-  if (!isAdminIpAllowed(getClientIp(req))) {
+  const clientIp = getClientIp(req);
+  const ipAllowed = isAdminIpAllowed(clientIp);
+
+  if (ADMIN_IP_ENFORCE && !ipAllowed) {
     return res.status(403).json({ error: 'Acceso admin denegado para esta IP' });
+  }
+
+  if (!ADMIN_IP_ENFORCE && !ipAllowed) {
+    console.warn(`⚠️ Admin login desde IP fuera de whitelist permitida por ADMIN_IP_ENFORCE=false: ${normalizeIp(clientIp) || 'unknown'}`);
   }
 
   try {
