@@ -254,6 +254,12 @@ const REVIEW_NOTIFICATION_EMAIL = process.env.REVIEW_NOTIFICATION_EMAIL || 'fern
 const RESEND_API_KEY = String(process.env.RESEND_API_KEY || '').trim();
 const RESEND_FROM = String(process.env.RESEND_FROM || '').trim();
 const EXPO_PUSH_API_URL = 'https://exp.host/--/api/v2/push/send';
+const EXPO_PUSH_RECEIPTS_API_URL = 'https://exp.host/--/api/v2/push/getReceipts';
+const EXPO_TOKEN_INVALID_ERROR_CODES = new Set([
+  'DeviceNotRegistered',
+  'MismatchSenderId',
+  'InvalidCredentials',
+]);
 
 const isValidExpoPushToken = (token) => {
   const normalized = String(token || '').trim();
@@ -286,7 +292,7 @@ const deactivateInvalidExpoTokens = async (tokens = []) => {
 const sendExpoPushNotificationToAll = async ({ title, body, data = {} }) => {
   const activeTokens = await MobilePushToken.find({ active: true }).select('token -_id');
   if (!activeTokens.length) {
-    return { delivered: 0, invalidated: 0 };
+    return { delivered: 0, invalidated: 0, receiptErrors: 0 };
   }
 
   const messages = activeTokens
@@ -303,6 +309,8 @@ const sendExpoPushNotificationToAll = async ({ title, body, data = {} }) => {
     }));
 
   const invalidTokens = [];
+  const ticketToToken = new Map();
+  let receiptErrors = 0;
   const messageChunks = chunkArray(messages, 100);
 
   for (const chunk of messageChunks) {
@@ -321,12 +329,22 @@ const sendExpoPushNotificationToAll = async ({ title, body, data = {} }) => {
       const tickets = Array.isArray(payload?.data) ? payload.data : [];
 
       tickets.forEach((ticket, ticketIndex) => {
-        if (ticket?.status !== 'error') return;
+        const token = chunk[ticketIndex]?.to;
+        if (!token) return;
 
-        const errorCode = ticket?.details?.error;
-        if (errorCode === 'DeviceNotRegistered') {
-          const token = chunk[ticketIndex]?.to;
-          if (token) invalidTokens.push(token);
+        if (ticket?.status === 'ok') {
+          const ticketId = String(ticket?.id || '').trim();
+          if (ticketId) {
+            ticketToToken.set(ticketId, token);
+          }
+          return;
+        }
+
+        if (ticket?.status === 'error') {
+          const errorCode = String(ticket?.details?.error || '').trim();
+          if (EXPO_TOKEN_INVALID_ERROR_CODES.has(errorCode)) {
+            invalidTokens.push(token);
+          }
         }
       });
     } catch (error) {
@@ -334,13 +352,52 @@ const sendExpoPushNotificationToAll = async ({ title, body, data = {} }) => {
     }
   }
 
-  if (invalidTokens.length) {
-    await deactivateInvalidExpoTokens(invalidTokens);
+  const receiptIds = Array.from(ticketToToken.keys());
+  const receiptChunks = chunkArray(receiptIds, 300);
+
+  for (const idsChunk of receiptChunks) {
+    if (!idsChunk.length) continue;
+
+    try {
+      const response = await fetch(EXPO_PUSH_RECEIPTS_API_URL, {
+        method: 'POST',
+        headers: {
+          Accept: 'application/json',
+          'Accept-encoding': 'gzip, deflate',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ ids: idsChunk }),
+      });
+
+      const payload = await response.json().catch(() => null);
+      const receipts = payload?.data && typeof payload.data === 'object' ? payload.data : {};
+
+      idsChunk.forEach((receiptId) => {
+        const receipt = receipts?.[receiptId];
+        if (!receipt || receipt.status !== 'error') return;
+
+        receiptErrors += 1;
+        const errorCode = String(receipt?.details?.error || '').trim();
+        if (EXPO_TOKEN_INVALID_ERROR_CODES.has(errorCode)) {
+          const token = ticketToToken.get(receiptId);
+          if (token) invalidTokens.push(token);
+        }
+      });
+    } catch (error) {
+      console.error('❌ Error consultando receipts de Expo:', error?.message || 'Sin detalle');
+    }
   }
+
+  if (invalidTokens.length) {
+    await deactivateInvalidExpoTokens(Array.from(new Set(invalidTokens)));
+  }
+
+  console.log(`🔔 Push resumen: enviados=${messages.length}, invalidados=${Array.from(new Set(invalidTokens)).length}, receiptErrors=${receiptErrors}`);
 
   return {
     delivered: messages.length,
-    invalidated: invalidTokens.length,
+    invalidated: Array.from(new Set(invalidTokens)).length,
+    receiptErrors,
   };
 };
 
@@ -1239,6 +1296,7 @@ app.post('/api/mobile/push/test', requireAdminAuth, async (req, res) => {
       activeTokens,
       delivered: Number(result?.delivered ?? 0),
       invalidated: Number(result?.invalidated ?? 0),
+      receiptErrors: Number(result?.receiptErrors ?? 0),
     });
   } catch (error) {
     return res.status(500).json({ error: 'Error al enviar notificación de prueba' });
